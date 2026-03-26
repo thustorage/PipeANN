@@ -13,6 +13,9 @@
 #include "utils.h"
 
 namespace pipeann {
+  template<typename T>
+  void normalize_data_file(const std::string &inFileName, const std::string &outFileName);
+
   int merge_shards(const std::string &vamana_prefix, const std::string &vamana_suffix, const std::string &idmaps_prefix,
                    const std::string &idmaps_suffix, const uint64_t nshards, unsigned max_degree,
                    const std::string &output_vamana, const std::string &medoids_file);

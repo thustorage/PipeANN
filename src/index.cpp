@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <thread>
 #include <omp.h>
 #include <shared_mutex>
@@ -26,6 +28,7 @@
 #include "utils.h"
 #include "utils/lock_table.h"
 #include "utils/prune_neighbors.h"
+
 
 namespace pipeann {
   // Initialize an index with metric m, load the data of type T with filename
@@ -148,8 +151,7 @@ namespace pipeann {
     load_bin<TagT>(std::string(tag_filename), tag_data, file_num_points, file_dim, offset);
 
     if (file_dim != 1) {
-      LOG(ERROR) << "ERROR: Loading " << file_dim << " dimensions for tags,"
-                 << "but tag file must have 1 dimension.";
+      LOG(ERROR) << "ERROR: Loading " << file_dim << " dimensions for tags," << "but tag file must have 1 dimension.";
       crash();
     }
 
@@ -182,8 +184,8 @@ namespace pipeann {
     _empty_slots.clear();
 
     if (file_dim != _dim) {
-      LOG(ERROR) << "ERROR: Driver requests loading " << _dim << " dimension,"
-                 << "but file has " << file_dim << " dimension.";
+      LOG(ERROR) << "ERROR: Driver requests loading " << _dim << " dimension," << "but file has " << file_dim
+                 << " dimension.";
       crash();
     }
 
@@ -584,6 +586,15 @@ namespace pipeann {
       }
     }
 
+    final_prune(params);
+    if (_nd > 0) {
+      LOG(INFO) << "done. Link time: " << ((double) link_timer.elapsed() / (double) 1000000) << "s";
+    }
+  }
+
+  template<typename T, typename TagT>
+  void Index<T, TagT>::final_prune(IndexBuildParameters &params) {
+    int64_t n_vecs_to_visit = _nd;
     if (_nd > 0) {
       LOG(INFO) << "Starting final cleanup..";
     }
@@ -610,9 +621,6 @@ namespace pipeann {
           _final_graph[node].emplace_back(id);
       }
     }
-    if (_nd > 0) {
-      LOG(INFO) << "done. Link time: " << ((double) link_timer.elapsed() / (double) 1000000) << "s";
-    }
   }
 
   template<typename T, typename TagT>
@@ -638,8 +646,8 @@ namespace pipeann {
         crash();
       }
       if (file_dim != _dim) {
-        LOG(ERROR) << "ERROR: Driver requests loading " << _dim << " dimension,"
-                   << "but file has " << file_dim << " dimension.";
+        LOG(ERROR) << "ERROR: Driver requests loading " << _dim << " dimension," << "but file has " << file_dim
+                   << " dimension.";
         crash();
       }
 
@@ -665,7 +673,11 @@ namespace pipeann {
       }
     }
 
-    link(params);  // Primary func for creating nsg graph
+    if (params.use_pipnn) {
+      pipnn_link(params);
+    } else {
+      link(params);
+    }
 
     size_t max_deg = 0, min_deg = 1 << 30, total = 0, cnt = 0;
     for (size_t i = 0; i < _nd; i++) {

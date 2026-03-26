@@ -321,6 +321,25 @@ namespace pipeann {
     return total_recall / (num_queries) * (100.0 / recall_at);
   }
 
+  struct PiPNNConfig {
+    int cmax = 2048;
+    int cmin = 256;
+    float p_samp = 0.01f;
+    int pmax = 1000;
+    int first_layer_fanout = 6;
+    int second_layer_fanout = 10;
+    int k = 2;                    // k-NN in leaf build
+    int num_hyperplanes = 12;
+    int climit = 128;
+    uint32_t seed = 42;
+
+    void print() {
+      LOG(INFO) << "PiPNNConfig: cmax=" << cmax << " cmin=" << cmin << " p_samp=" << p_samp << " pmax=" << pmax
+                << " first_layer_fanout=" << first_layer_fanout << " second_layer_fanout=" << second_layer_fanout
+                << " k=" << k << " num_hyperplanes=" << num_hyperplanes << " climit=" << climit << " seed=" << seed;
+    }
+  };
+
   /* Parameters for index build. */
   struct IndexBuildParameters {
     uint32_t R = 0;              // maximum out-neighbors.
@@ -330,6 +349,8 @@ namespace pipeann {
     uint32_t num_threads = 0;    // num_threads used.
     bool saturate_graph = true;  // saturate graph during build (using kNN neighbors).
     uint32_t beam_width = 4;     // insert beam width. (for SSD)
+    bool use_pipnn = false;
+    PiPNNConfig pipnn_config;
 
     void set(uint32_t R, uint32_t L, uint32_t C, float alpha = 1.2, uint32_t num_threads = 0,
              bool saturate_graph = true, uint32_t beam_width = 4) {
@@ -342,10 +363,20 @@ namespace pipeann {
       this->saturate_graph = saturate_graph;
     }
 
+    void pipnn_set(int cmax, int cmin, float p_samp, int pmax, int first_layer_fanout, int second_layer_fanout,
+                   int k, int num_hyperplanes, int climit, uint32_t seed = 42) {
+      this->use_pipnn = true;
+      this->pipnn_config = {cmax, cmin, p_samp, pmax, first_layer_fanout, second_layer_fanout,
+                            k, num_hyperplanes, climit, seed};
+    }
+
     void print() {
       LOG(INFO) << "IndexBuildParameters with L: " << L << " R: " << R << " C: " << C << " alpha: " << alpha
                 << " num_threads: " << num_threads << " beam_width: " << beam_width
                 << " saturate_graph: " << saturate_graph;
+      if (use_pipnn) {
+        pipnn_config.print();
+      }
     }
   };
 

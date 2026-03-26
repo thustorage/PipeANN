@@ -10,6 +10,7 @@
 
 #include "distance.h"
 #include "utils.h"
+#include "utils/pipnn.h"
 
 #define OVERHEAD_FACTOR 1.1
 #define SLACK_FACTOR 1.3
@@ -103,6 +104,15 @@ namespace pipeann {
     void inter_insert(unsigned n, std::vector<unsigned> &pruned_list, const IndexBuildParameters &params);
 
     void link(IndexBuildParameters &params);
+
+    // Graph Build Algorithm of PiPNN.
+    void pipnn_link(IndexBuildParameters &params);
+
+    void final_prune(IndexBuildParameters &params);
+
+    std::vector<std::vector<uint32_t>> pipnn_partition(const std::vector<uint32_t> &node_ids,
+                                                       IndexBuildParameters &params);
+    std::vector<WeightedEdge> pipnn_build_leaf_nodes(const std::vector<uint32_t> &nodes, int k);
 
     // Support for Incremental Indexing
     uint32_t reserve_location();
