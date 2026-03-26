@@ -10,7 +10,6 @@
 #include <cstring>
 #include <limits>
 #include <queue>
-#include <cblas.h>
 #include <stdlib.h>
 
 #include "omp.h"
@@ -18,7 +17,6 @@
 #include "distance.h"
 #include "filter/label.h"
 #include "filter/selector.h"
-#include "utils/kmeans_utils.h"
 
 // WORKS FOR UPTO 2 BILLION POINTS (as we use INT INSTEAD OF UNSIGNED)
 
@@ -34,90 +32,39 @@ struct cmpmaxstruct {
 
 using maxPQIFCS = std::priority_queue<pairIF, std::vector<pairIF>, cmpmaxstruct>;
 
-void distsq_to_points(const size_t dim,
-                      float *dist_matrix,  // Col Major, cols are queries, rows are points
-                      size_t npoints, const float *const points,
-                      const float *const points_l2sq,  // points in Col major
-                      size_t nqueries, const float *const queries,
-                      const float *const queries_l2sq,  // queries in Col major
-                      float *ones_vec = NULL)           // Scratchspace of num_data size and init to 1.0
-{
-  bool ones_vec_alloc = false;
-  if (ones_vec == NULL) {
-    ones_vec = new float[nqueries > npoints ? nqueries : npoints];
-    std::fill_n(ones_vec, nqueries > npoints ? nqueries : npoints, (float) 1.0);
-    ones_vec_alloc = true;
-  }
-  cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, npoints, nqueries, dim, (float) -2.0, points, dim, queries, dim,
-              (float) 0.0, dist_matrix, npoints);
-  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans, npoints, nqueries, 1, (float) 1.0, points_l2sq, npoints,
-              ones_vec, nqueries, (float) 1.0, dist_matrix, npoints);
-  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasTrans, npoints, nqueries, 1, (float) 1.0, ones_vec, npoints,
-              queries_l2sq, nqueries, (float) 1.0, dist_matrix, npoints);
-  if (ones_vec_alloc)
-    delete[] ones_vec;
-}
-
-void inner_prod_to_points(const size_t dim,
-                          float *dist_matrix,  // Col Major, cols are queries, rows are points
-                          size_t npoints, const float *const points, size_t nqueries, const float *const queries,
-                          float *ones_vec = NULL)  // Scratchspace of num_data size and init to 1.0
-{
-  bool ones_vec_alloc = false;
-  if (ones_vec == NULL) {
-    ones_vec = new float[nqueries > npoints ? nqueries : npoints];
-    std::fill_n(ones_vec, nqueries > npoints ? nqueries : npoints, (float) 1.0);
-    ones_vec_alloc = true;
-  }
-  cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, npoints, nqueries, dim, (float) -1.0, points, dim, queries, dim,
-              (float) 0.0, dist_matrix, npoints);
-
-  if (ones_vec_alloc)
-    delete[] ones_vec;
-}
-
 void exact_knn(const size_t dim, const size_t k,
                int *const closest_points,         // k * num_queries preallocated, col major, queries columns
                float *const dist_closest_points,  // k * num_queries. preallocated, Dist to corresponding closest_points
                size_t npoints,
-               float *points_in,  // points in Col major
+               float *points_in,  // Row major
                size_t nqueries,
-               float *queries_in,  // queries in Col major
+               float *queries_in,  // Row major
                pipeann::Metric metric = pipeann::Metric::L2) {
-  float *points = points_in;
-  float *queries = queries_in;
-
-  float *points_l2sq = new float[npoints];
-  float *queries_l2sq = new float[nqueries];
-  kmeans::compute_vecs_l2sq(points_l2sq, points_in, npoints, dim);
-  kmeans::compute_vecs_l2sq(queries_l2sq, queries_in, nqueries, dim);
+  pipeann::Distance<float> *distance = pipeann::get_distance_function<float>(metric);
 
   std::cout << "Going to compute " << k << " NNs for " << nqueries << " queries over " << npoints << " points in "
             << dim << " dimensions using " << pipeann::get_metric_str(metric) << std::endl;
 
   size_t q_batch_size = (1 << 9);
+  // bulk_compare(queries_batch, batch_size, points, npoints, dim, dist_matrix) produces
+  // dist_matrix[q_local * npoints + p], which matches the col-major access dist_matrix[p + q_local * npoints].
   float *dist_matrix = new float[(size_t) q_batch_size * (size_t) npoints];
 
   for (uint64_t b = 0; b < DIV_ROUND_UP(nqueries, q_batch_size); ++b) {
     int64_t q_b = b * q_batch_size;
     int64_t q_e = ((b + 1) * q_batch_size > nqueries) ? nqueries : (b + 1) * q_batch_size;
 
-    if (metric == pipeann::Metric::L2 || metric == pipeann::Metric::COSINE) {
-      distsq_to_points(dim, dist_matrix, npoints, points, points_l2sq, q_e - q_b, queries + q_b * dim,
-                       queries_l2sq + q_b);
-    } else {
-      inner_prod_to_points(dim, dist_matrix, npoints, points, q_e - q_b, queries + q_b * dim);
-    }
+    distance->bulk_compare(queries_in + q_b * dim, q_e - q_b, points_in, npoints, dim, dist_matrix);
     std::cout << "Computed distances for queries: [" << q_b << "," << q_e << ")" << std::endl;
 
 #pragma omp parallel for schedule(dynamic, 16)
     for (int64_t q = q_b; q < q_e; q++) {
       maxPQIFCS point_dist;
       for (uint64_t p = 0; p < k; p++)
-        point_dist.emplace(p, dist_matrix[p + (q - q_b) * npoints]);
+        point_dist.emplace(p, dist_matrix[(q - q_b) * npoints + p]);
       for (uint64_t p = k; p < npoints; p++) {
-        if (point_dist.top().second > dist_matrix[p + (q - q_b) * npoints])
-          point_dist.emplace(p, dist_matrix[p + (q - q_b) * npoints]);
+        if (point_dist.top().second > dist_matrix[(q - q_b) * npoints + p])
+          point_dist.emplace(p, dist_matrix[(q - q_b) * npoints + p]);
         if (point_dist.size() > k)
           point_dist.pop();
       }
@@ -131,13 +78,11 @@ void exact_knn(const size_t dim, const size_t k,
   }
 
   delete[] dist_matrix;
-
-  delete[] points_l2sq;
-  delete[] queries_l2sq;
+  delete distance;
 
   if (metric == pipeann::Metric::COSINE) {
-    delete[] points;
-    delete[] queries;
+    delete[] points_in;
+    delete[] queries_in;
   }
 }
 
@@ -215,8 +160,7 @@ inline std::vector<uint32_t> get_matching_points(pipeann::AbstractSelector *sele
 }
 
 // Compute distance between a query and a single point
-inline float compute_distance(const float *query, const float *point, size_t dim, pipeann::Metric metric) {
-  pipeann::Distance<float> *distance = pipeann::get_distance_function<float>(metric);
+inline float compute_distance(const float *query, const float *point, size_t dim, pipeann::Distance<float> *distance) {
   return distance->compare(query, point, dim);
 }
 
@@ -240,6 +184,8 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, pipeann::AbstractSel
       pipeann::normalize_data(query_data + i * dim, query_data + i * dim, dim);
     }
   }
+
+  pipeann::Distance<float> *distance = pipeann::get_distance_function<float>(metric);
 
   std::vector<std::vector<std::pair<uint32_t, float>>> results(nqueries);
 
@@ -293,7 +239,7 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, pipeann::AbstractSel
 
         for (uint32_t point_id : matching_points) {
           uint32_t local_id = point_id - start_id;
-          float dist = compute_distance(query_data + q * dim, base_data + local_id * dim, dim, metric);
+          float dist = compute_distance(query_data + q * dim, base_data + local_id * dim, dim, distance);
           point_dists.push_back(std::make_pair(point_id, dist));
         }
 
@@ -363,6 +309,7 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, pipeann::AbstractSel
   pipeann::aligned_free(query_data);
   delete[] closest_points;
   delete[] dist_closest_points;
+  delete distance;
   if (tags != nullptr) {
     delete[] tags;
   }

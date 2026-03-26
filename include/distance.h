@@ -10,6 +10,13 @@ namespace pipeann {
   class Distance {
    public:
     virtual float compare(const T *a, const T *b, unsigned length) const = 0;
+    virtual void bulk_compare(const T *a, size_t n, const T *b, size_t m, unsigned length, float *result) const {
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] = compare(a + i * length, b + j * length, length);
+        }
+      }
+    }
     virtual ~Distance() {
     }
   };
@@ -17,31 +24,43 @@ namespace pipeann {
   class DistanceCosineInt8 : public Distance<int8_t> {
    public:
     virtual float compare(const int8_t *a, const int8_t *b, uint32_t length) const;
+    virtual void bulk_compare(const int8_t *a, size_t n, const int8_t *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   class DistanceCosineFloat : public Distance<float> {
    public:
     virtual float compare(const float *a, const float *b, uint32_t length) const;
+    virtual void bulk_compare(const float *a, size_t n, const float *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   class DistanceCosineUInt8 : public Distance<uint8_t> {
    public:
     virtual float compare(const uint8_t *a, const uint8_t *b, uint32_t length) const;
+    virtual void bulk_compare(const uint8_t *a, size_t n, const uint8_t *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   class DistanceL2Int8 : public Distance<int8_t> {
    public:
     virtual float compare(const int8_t *a, const int8_t *b, uint32_t size) const;
+    virtual void bulk_compare(const int8_t *a, size_t n, const int8_t *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   class DistanceL2UInt8 : public Distance<uint8_t> {
    public:
     virtual float compare(const uint8_t *a, const uint8_t *b, uint32_t size) const;
+    virtual void bulk_compare(const uint8_t *a, size_t n, const uint8_t *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   class DistanceL2Float : public Distance<float> {
    public:
     virtual float compare(const float *a, const float *b, uint32_t size) const __attribute__((hot));
+    virtual void bulk_compare(const float *a, size_t n, const float *b, size_t m, unsigned length,
+                              float *result) const override;
   };
 
   template<typename T>

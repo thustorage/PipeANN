@@ -1,4 +1,6 @@
 #include <immintrin.h>
+#include <cblas.h>
+#include <vector>
 #include "utils.h"
 #include "distance.h"
 
@@ -442,6 +444,250 @@ namespace pipeann {
       diff += c1 * c1;
     }
     return diff;
+  }
+
+  void DistanceL2Float::bulk_compare(const float *a, size_t n, const float *b, size_t m, unsigned length,
+                                     float *result) const {
+    if (a == b && n == m) {
+      std::vector<float> sq(n);
+      for (size_t i = 0; i < n; i++) {
+        sq[i] = cblas_sdot(length, a + i * length, 1, a + i * length, 1);
+      }
+
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -2.0f, a, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += sq[i] + sq[j];
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      std::vector<float> a_sq(n);
+      for (size_t i = 0; i < n; i++) {
+        a_sq[i] = cblas_sdot(length, a + i * length, 1, a + i * length, 1);
+      }
+
+      std::vector<float> b_sq(m);
+      for (size_t j = 0; j < m; j++) {
+        b_sq[j] = cblas_sdot(length, b + j * length, 1, b + j * length, 1);
+      }
+
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -2.0f, a, length, b, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += a_sq[i] + b_sq[j];
+        }
+      }
+    }
+  }
+
+  void DistanceCosineFloat::bulk_compare(const float *a, size_t n, const float *b, size_t m, unsigned length,
+                                         float *result) const {
+    if (a == b && n == m) {
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -1.0f, a, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += 1.0f;
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -1.0f, a, length, b, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += 1.0f;
+        }
+      }
+    }
+  }
+
+  // Helper: cast integer array to float for BLAS operations.
+  static void cast_to_float(const int8_t *src, float *dst, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+      dst[i] = static_cast<float>(src[i]);
+    }
+  }
+
+  static void cast_to_float(const uint8_t *src, float *dst, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+      dst[i] = static_cast<float>(src[i]);
+    }
+  }
+
+  void DistanceL2Int8::bulk_compare(const int8_t *a, size_t n, const int8_t *b, size_t m, unsigned length,
+                                    float *result) const {
+    std::vector<float> fa(n * length), fb;
+    cast_to_float(a, fa.data(), n * length);
+
+    const float *fb_ptr;
+    if (a == b && n == m) {
+      fb_ptr = fa.data();
+    } else {
+      fb.resize(m * length);
+      cast_to_float(b, fb.data(), m * length);
+      fb_ptr = fb.data();
+    }
+
+    if (a == b && n == m) {
+      std::vector<float> sq(n);
+      for (size_t i = 0; i < n; i++) {
+        sq[i] = cblas_sdot(length, fa.data() + i * length, 1, fa.data() + i * length, 1);
+      }
+
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -2.0f, fa.data(), length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += sq[i] + sq[j];
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      std::vector<float> a_sq(n);
+      for (size_t i = 0; i < n; i++) {
+        a_sq[i] = cblas_sdot(length, fa.data() + i * length, 1, fa.data() + i * length, 1);
+      }
+
+      std::vector<float> b_sq(m);
+      for (size_t j = 0; j < m; j++) {
+        b_sq[j] = cblas_sdot(length, fb_ptr + j * length, 1, fb_ptr + j * length, 1);
+      }
+
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -2.0f, fa.data(), length, fb_ptr, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += a_sq[i] + b_sq[j];
+        }
+      }
+    }
+  }
+
+  void DistanceL2UInt8::bulk_compare(const uint8_t *a, size_t n, const uint8_t *b, size_t m, unsigned length,
+                                     float *result) const {
+    std::vector<float> fa(n * length), fb;
+    cast_to_float(a, fa.data(), n * length);
+
+    const float *fb_ptr;
+    if (a == b && n == m) {
+      fb_ptr = fa.data();
+    } else {
+      fb.resize(m * length);
+      cast_to_float(b, fb.data(), m * length);
+      fb_ptr = fb.data();
+    }
+
+    if (a == b && n == m) {
+      std::vector<float> sq(n);
+      for (size_t i = 0; i < n; i++) {
+        sq[i] = cblas_sdot(length, fa.data() + i * length, 1, fa.data() + i * length, 1);
+      }
+
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -2.0f, fa.data(), length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += sq[i] + sq[j];
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      std::vector<float> a_sq(n);
+      for (size_t i = 0; i < n; i++) {
+        a_sq[i] = cblas_sdot(length, fa.data() + i * length, 1, fa.data() + i * length, 1);
+      }
+
+      std::vector<float> b_sq(m);
+      for (size_t j = 0; j < m; j++) {
+        b_sq[j] = cblas_sdot(length, fb_ptr + j * length, 1, fb_ptr + j * length, 1);
+      }
+
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -2.0f, fa.data(), length, fb_ptr, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += a_sq[i] + b_sq[j];
+        }
+      }
+    }
+  }
+
+  void DistanceCosineInt8::bulk_compare(const int8_t *a, size_t n, const int8_t *b, size_t m, unsigned length,
+                                        float *result) const {
+    std::vector<float> fa(n * length), fb;
+    cast_to_float(a, fa.data(), n * length);
+
+    const float *fb_ptr;
+    if (a == b && n == m) {
+      fb_ptr = fa.data();
+    } else {
+      fb.resize(m * length);
+      cast_to_float(b, fb.data(), m * length);
+      fb_ptr = fb.data();
+    }
+
+    if (a == b && n == m) {
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -1.0f, fa.data(), length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += 16129.0f;
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -1.0f, fa.data(), length, fb_ptr, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += 16129.0f;
+        }
+      }
+    }
+  }
+
+  void DistanceCosineUInt8::bulk_compare(const uint8_t *a, size_t n, const uint8_t *b, size_t m, unsigned length,
+                                         float *result) const {
+    std::vector<float> fa(n * length), fb;
+    cast_to_float(a, fa.data(), n * length);
+
+    const float *fb_ptr;
+    if (a == b && n == m) {
+      fb_ptr = fa.data();
+    } else {
+      fb.resize(m * length);
+      cast_to_float(b, fb.data(), m * length);
+      fb_ptr = fb.data();
+    }
+
+    if (a == b && n == m) {
+      cblas_ssyrk(CblasRowMajor, CblasUpper, CblasNoTrans, n, length, -1.0f, fa.data(), length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        result[i * m + i] = 0.0f;
+        for (size_t j = i + 1; j < m; j++) {
+          result[i * m + j] += 65025.0f;
+          result[j * m + i] = result[i * m + j];
+        }
+      }
+    } else {
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, m, length, -1.0f, fa.data(), length, fb_ptr, length, 0.0f, result, m);
+
+      for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < m; j++) {
+          result[i * m + j] += 65025.0f;
+        }
+      }
+    }
   }
 
   // Cosine distance functions (inner product based, assumes normalized vectors).
