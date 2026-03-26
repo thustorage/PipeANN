@@ -14,7 +14,6 @@
 #include "pipnn.h"
 #include "index.h"
 #include "utils/index_build_utils.h"
-#include "utils/pipnn.h"
 #include "utils/timer.h"
 
 namespace pipeann {
@@ -230,7 +229,7 @@ namespace pipeann {
     auto merge = [&cmin, &cmax, &gens](Partition &partitions) {
       std::vector<int> small_indices;
       for (int i = 0; i < (int) partitions.size(); i++) {
-        if (partitions[i].size() < cmin) {
+        if ((int) partitions[i].size() < cmin) {
           small_indices.push_back(i);
         }
       }
@@ -363,7 +362,7 @@ namespace pipeann {
     // Sequential recursive function
     std::function<Partition(const std::vector<uint32_t> &, int)> recurse_serial;
     recurse_serial = [&](const std::vector<uint32_t> &nodes, int depth) -> Partition {
-      if (nodes.size() <= cmax) {
+      if ((int) nodes.size() <= cmax) {
         return {nodes};
       }
 

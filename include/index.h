@@ -10,7 +10,7 @@
 
 #include "distance.h"
 #include "utils.h"
-#include "utils/pipnn.h"
+#include "pipnn.h"
 
 #define OVERHEAD_FACTOR 1.1
 #define SLACK_FACTOR 1.3
