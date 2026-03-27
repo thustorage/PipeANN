@@ -30,6 +30,7 @@ PipeANN is suitable for both **large-scale** and **memory-constraint** scenarios
 
 ## 📰 Updates
 
+- **Mar 27, 2026**: [PiPNN](http://arxiv.org/abs/2603.01779) indexing algorithm supported
 - **Dec 4, 2025**: Inner product and filtered ANNS (*arbitrary filter*) supported
 - **Oct 14, 2025**: [RaBitQ](https://github.com/VectorDB-NTU/RaBitQ-Library) (1-bit and multi-bit quantization) supported
 - **Sep 29, 2025**: Python interface released
@@ -256,7 +257,14 @@ mv deep.bin100000000 deep_100M.bin
 build/tests/utils/compute_groundtruth uint8 l2 bigann_100M.bin query.bin 1000 100M_gt.bin null null
 ```
   
-**3. Build on-disk index**:
+**3 Build on-disk index**:
+
+PipeANN now supports two indexing building algorithms (with the same file format):
+  
+**3.1 Build on-disk index (Vamana)**:
+
+To build a Vamana (DiskANN-style) index, run:
+
 ```bash
 # build_disk_index <type> <data> <prefix> <R> <L> <PQ_bytes> <M_GB> <threads> <metric> <nbr_type>
 build/tests/build_disk_index uint8 data.bin index 96 128 32 256 112 l2 pq
@@ -278,6 +286,20 @@ build/tests/build_disk_index uint8 data.bin index 96 128 32 256 112 l2 pq
 | SPACEV1B | int8 | 128 | 200 | 32 | 500GB | 112 |
 
 This requires ~5h for 100M-scale datasets, and ~1d for billion-scale datasets.
+
+**3.2 Build on-disk index (PiPNN)**
+
+[PiPNN](http://arxiv.org/abs/2603.01779) (Pick-in-Partitions Nearest Neighbors) is a graph construction algorithm. It partitions the dataset into overlapping sub-problems and leverages dense matrix multiplication kernels.
+
+```bash
+# build_pipnn_index <type> <data> <prefix> <R> <L1fanout> <L2fanout> <PQ_bytes> <M_GB (unused)> <threads> <metric> <nbr_type>
+build/tests/build_pipnn_index uint8 data.bin index 96 9 10 32 256 112 l2 pq
+```
+
+Most parameters are similar to Vamana, except:
+- `L1fanout` and `L2fanout`: Control the replication factor during construction. Typically `L1fanout * L2fanout` works similarly to `L` in Vamana.
+- `M_GB`: Memory limits are not supported for PiPNN currently, so this option is unused.
+
 
 **4. Build in-memory index** (optional but recommended):
 
