@@ -30,7 +30,7 @@ PipeANN is suitable for both **large-scale** and **memory-constraint** scenarios
 
 ## 📰 Updates
 
-- **Mar 27, 2026**: [PiPNN](http://arxiv.org/abs/2603.01779) indexing algorithm supported
+- **Mar 27, 2026**: [PiPNN](http://arxiv.org/abs/2602.21247) indexing algorithm supported
 - **Dec 4, 2025**: Inner product and filtered ANNS (*arbitrary filter*) supported
 - **Oct 14, 2025**: [RaBitQ](https://github.com/VectorDB-NTU/RaBitQ-Library) (1-bit and multi-bit quantization) supported
 - **Sep 29, 2025**: Python interface released
@@ -289,7 +289,7 @@ This requires ~5h for 100M-scale datasets, and ~1d for billion-scale datasets.
 
 **3.2 Build on-disk index (PiPNN)**
 
-[PiPNN](http://arxiv.org/abs/2603.01779) (Pick-in-Partitions Nearest Neighbors) is a graph construction algorithm. It partitions the dataset into overlapping sub-problems and leverages dense matrix multiplication kernels.
+[PiPNN](http://arxiv.org/abs/2602.21247) (Pick-in-Partitions Nearest Neighbors) is a graph construction algorithm. It partitions the dataset into overlapping sub-problems and leverages dense matrix multiplication kernels.
 
 ```bash
 # build_pipnn_index <type> <data> <prefix> <R> <L1fanout> <L2fanout> <PQ_bytes> <M_GB (unused)> <threads> <metric> <nbr_type>
