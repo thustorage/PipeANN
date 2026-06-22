@@ -5,22 +5,92 @@
 #include "aligned_file_reader.h"
 #include "utils.h"
 #include "utils/picojson.h"
+#include <algorithm>
 #include <fstream>
 #include <vector>
-#include <array>
 #include <cstring>
 #include <cstdint>
 #include <map>
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
 #include "filter_utils.h"
+#include "utils/cityhash.h"
 #include "utils/lock_table.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 
 namespace pipeann {
   // Currently, we only support vector of uint32_t attributes.
   using Attribute = std::vector<uint32_t>;
+
+  inline Attribute pack_string_attr(std::string_view s) {
+    size_t pad = (4 - (s.size() % 4)) % 4;
+    Attribute out((s.size() + pad) / 4);
+    if (!s.empty())
+      std::memcpy(out.data(), s.data(), s.size());
+    return out;
+  }
+
+  inline std::string_view string_attr_view(const Attribute &a) {
+    if (a.empty())
+      return std::string_view();
+    const char *p = reinterpret_cast<const char *>(a.data());
+    size_t n = a.size() * sizeof(uint32_t);
+    size_t len = 0;
+    while (len < n && p[len] != '\0')
+      len++;
+    return std::string_view(p, len);
+  }
+
+  inline std::string string_attr_to_string(const Attribute &a) {
+    return std::string(string_attr_view(a));
+  }
+
+  inline Attribute reverse_string_attr(const Attribute &a) {
+    std::string out(string_attr_view(a));
+    std::reverse(out.begin(), out.end());
+    return pack_string_attr(out);
+  }
+
+  inline Attribute next_string_attr_prefix(const Attribute &prefix) {
+    std::string b(string_attr_view(prefix));
+    for (int i = (int) b.size() - 1; i >= 0; --i) {
+      unsigned char c = (unsigned char) b[i];
+      if (c != 0xFF) {
+        b[i] = (char) (c + 1);
+        b.resize(i + 1);
+        return pack_string_attr(b);
+      }
+    }
+    return Attribute();  // empty = +inf sentinel for upper-bound purposes.
+  }
+
+  inline bool string_attr_starts_with(const Attribute &s, const Attribute &prefix) {
+    std::string_view sv = string_attr_view(s);
+    std::string_view pv = string_attr_view(prefix);
+    return sv.size() >= pv.size() && sv.substr(0, pv.size()) == pv;
+  }
+
+  inline bool string_attr_ends_with(const Attribute &s, const Attribute &suffix) {
+    std::string_view sv = string_attr_view(s);
+    std::string_view pv = string_attr_view(suffix);
+    return sv.size() >= pv.size() && sv.substr(sv.size() - pv.size()) == pv;
+  }
+
+  inline bool str_attr_less(const Attribute &a, const Attribute &b) {
+    const char *pa = a.empty() ? "" : reinterpret_cast<const char *>(a.data());
+    const char *pb = b.empty() ? "" : reinterpret_cast<const char *>(b.data());
+    return std::strcmp(pa, pb) < 0;
+  }
+
+  struct StrAttrLess {
+    bool operator()(const Attribute &a, const Attribute &b) const {
+      return str_attr_less(a, b);
+    }
+  };
+
   inline std::tuple<int64_t, std::vector<int64_t>, std::vector<int32_t>, std::vector<float>> load_spmat(
       const std::string &spmat_filename) {
     std::ifstream reader(spmat_filename, std::ios::binary);
@@ -547,6 +617,10 @@ namespace pipeann {
 
     uint32_t estimate_label_cnt(uint32_t label) {
       // for label, its count is (end_of_label - start_of_label) / sizeof(uint32_t)
+      // A query label unseen in the base data (>= label_loc_ size) has zero matches.
+      if (unlikely(label >= label_loc_.size())) {
+        return 0;
+      }
       auto [st, ed] = label_loc_[label];
       return (ed - st) / sizeof(uint32_t);
     }
@@ -603,6 +677,10 @@ namespace pipeann {
 
       delta_attrs_mu_.lock_shared();
       for (auto &label : query) {
+        // A query label unseen in the base data has no inverted list; skip it.
+        if (unlikely(label >= label_loc_.size())) {
+          continue;
+        }
         auto [range_st, range_ed] = label_loc_[label];
         uint64_t len = range_ed - range_st;
         auto delta_it = delta_.find(label);
@@ -671,7 +749,7 @@ namespace pipeann {
       }
 
       // For hot labels, use bloom filter to check if query in target_id's labels.
-      size_t lock_idx = omp_get_thread_num();
+      size_t lock_idx = portable_thread_id();
       delta_attrs_mu_.lock_shared(lock_idx);
       auto bf = get_bloom_filter(target_id);
       for (auto &label : query) {
@@ -736,9 +814,12 @@ namespace pipeann {
       std::vector<IORequest> reqs;
       delta_attrs_mu_.lock_shared();
       for (auto &label : query) {
-        auto [range_st, range_ed] = label_loc_[label];
+        // For AND, a query label unseen in the base data (>= label_loc_ size)
+        // has an empty inverted list, so the intersection is empty.
+        bool out_of_range = label >= label_loc_.size();
+        auto [range_st, range_ed] = out_of_range ? std::make_pair<uint64_t, uint64_t>(0, 0) : label_loc_[label];
         uint64_t len = range_ed - range_st;
-        auto delta_it = delta_.find(label);
+        auto delta_it = out_of_range ? delta_.end() : delta_.find(label);
         auto delta_ptr = delta_it == delta_.end() ? nullptr : delta_it->second.data();
         uint64_t n_delta = delta_it == delta_.end() ? 0 : delta_it->second.size();
         if (unlikely(len + n_delta * sizeof(uint32_t) == 0)) {
@@ -819,7 +900,7 @@ namespace pipeann {
       }
 
       // All hot labels must pass bloom filter.
-      size_t lock_idx = omp_get_thread_num();
+      size_t lock_idx = portable_thread_id();
       delta_attrs_mu_.lock_shared(lock_idx);
       auto bf = get_bloom_filter(target_id);
       for (auto &label : query) {
@@ -967,7 +1048,7 @@ namespace pipeann {
     void load_histogram() {
       std::ifstream reader(filename, std::ios::binary);
       histogram_.clear();
-      stride = ROUND_UP(base_n_vectors_ / kHistogramBuckets, SECTOR_LEN / sizeof(uint32_t));
+      stride = std::max<uint64_t>(1, ROUND_UP(base_n_vectors_ / kHistogramBuckets, SECTOR_LEN / sizeof(uint32_t)));
       for (size_t i = 0; i < base_n_vectors_; i += stride) {
         uint32_t attr;
         reader.seekg(i * sizeof(uint32_t), std::ios::beg);
@@ -1198,7 +1279,7 @@ namespace pipeann {
     // Approximate membership test using quantized bucket IDs.
     // A vector is considered a member if its bucket range overlaps with the query range.
     bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &list) override {
-      size_t lock_idx = omp_get_thread_num();
+      size_t lock_idx = portable_thread_id();
       delta_attrs_mu_.lock_shared(lock_idx);
       uint32_t l = query[0], r = query.size() > 1 ? query[1] : l + 1;
       // Use quantized bucket check if available.
@@ -1365,6 +1446,669 @@ namespace pipeann {
     }
   };
 
+  // Sorted string attr index. Supports equality, prefix, suffix, and LIKE queries.
+  // Two sorted files: prefix (sorted by string) and suffix (sorted by reversed string).
+  //
+  // On-disk layout (same for both files):
+  //   [u32 n_entries][u32 n_sampled][u64 × n_sampled: sampled_offsets]
+  //   [entry_0][entry_1]...[entry_{n-1}]
+  //   Each entry: [u32 vector_id][u32 key_len][u32 × key_len: key_data]
+  //
+  // In-memory (loaded by load_approx):
+  //   - sampled_offsets[i] = byte offset of entry at index i*stride
+  //   - histogram[i] = key of entry at index i*stride (for in-memory binary search)
+  //   - hashes[vector_id] = CityHash32(key) for exact-eq is_member_approx
+  //   - bucket_boundaries + bucket_ids for directional range is_member_approx
+  struct StringAttrIndex : public AttrIndex {
+    enum Direction : uint32_t { PREFIX = 0, SUFFIX = 1, N_DIRECTIONS = 2 };
+    static constexpr uint32_t kBuckets = 256;
+    static constexpr uint32_t kSampleRate = 1000;
+
+    int suffix_fd_ = -1;
+
+    // Per-direction in-memory state (loaded from file header).
+    uint32_t n_entries_[N_DIRECTIONS] = {};
+    std::vector<uint64_t> sampled_offsets_[N_DIRECTIONS];
+    std::vector<Attribute> histogram_[N_DIRECTIONS];
+    uint64_t file_size_[N_DIRECTIONS] = {};
+
+    // Approx filters.
+    std::vector<uint32_t> hashes_;                            // per vector_id, CityHash32
+    std::vector<uint32_t> bucket_ids_[N_DIRECTIONS];          // per vector_id, bucket index
+    std::vector<Attribute> bucket_boundaries_[N_DIRECTIONS];  // kBuckets+1 boundary keys
+
+    // Full data (only when load_attrs() called).
+    std::vector<Attribute> strings_;
+    size_t max_attrs_ = 0;
+
+    // Delta (pending inserts, merged periodically).
+    std::map<Attribute, std::vector<uint32_t>, StrAttrLess> delta_[N_DIRECTIONS];
+    uint64_t delta_bytes_ = 0;
+
+    StringAttrIndex(const std::string &filename, uint64_t n_vectors) : AttrIndex(filename, n_vectors) {
+      suffix_fd_ = open((filename + ".rev").c_str(), O_RDWR | O_CREAT, 0666);
+      if (suffix_fd_ == -1) {
+        LOG(ERROR) << "Failed to open suffix file: " << filename << ".rev";
+        crash();
+      }
+    }
+
+    ~StringAttrIndex() override {
+      if (suffix_fd_ != -1)
+        close(suffix_fd_);
+    }
+
+    int fd_for(Direction dir) const {
+      return dir == PREFIX ? fd : suffix_fd_;
+    }
+
+    std::string approx_filename(Direction dir) const {
+      return dir == PREFIX ? filename + ".prefix" : filename + ".suffix";
+    }
+
+    static uint32_t hash_packed(const Attribute &a) {
+      return CityHash32(reinterpret_cast<const char *>(a.data()), a.size() * sizeof(uint32_t));
+    }
+
+    static bool like_match(std::string_view s, std::string_view p) {
+      size_t i = 0, j = 0, star = std::string::npos, mark = 0;
+      while (i < s.size()) {
+        if (j < p.size() && (p[j] == '_' || p[j] == s[i])) {
+          i++;
+          j++;
+        } else if (j < p.size() && p[j] == '%') {
+          star = j++;
+          mark = i;
+        } else if (star != std::string::npos) {
+          j = star + 1;
+          i = ++mark;
+        } else
+          return false;
+      }
+      while (j < p.size() && p[j] == '%')
+        j++;
+      return j == p.size();
+    }
+
+    static Attribute like_fixed_prefix(const Attribute &pattern) {
+      std::string_view p = string_attr_view(pattern);
+      size_t len = 0;
+      for (char c : p) {
+        if (c == '%' || c == '_')
+          break;
+        len++;
+      }
+      return pack_string_attr(p.substr(0, len));
+    }
+
+    static Attribute like_fixed_suffix(const Attribute &pattern) {
+      std::string_view p = string_attr_view(pattern);
+      size_t start = p.size();
+      for (int i = (int) p.size() - 1; i >= 0; --i) {
+        if (p[i] == '%' || p[i] == '_')
+          break;
+        start = (size_t) i;
+      }
+      return pack_string_attr(p.substr(start));
+    }
+
+    // --- Load / Save ---
+
+    size_t max_attrs() override {
+      return max_attrs_;
+    }
+
+    void load_from_rows(const std::vector<Attribute> &rows) override {
+      strings_ = rows;
+      n_vectors = rows.size();
+      base_n_vectors_ = rows.size();
+      max_attrs_ = 0;
+      for (const auto &r : rows)
+        max_attrs_ = std::max(max_attrs_, r.size());
+    }
+
+    Attribute get(uint32_t vector_id) override {
+      if (vector_id >= strings_.size())
+        return Attribute();
+      return strings_[vector_id];
+    }
+
+    // Read file header: n_entries, sampled_offsets, histogram keys.
+    void load_header(Direction dir) {
+      int f = fd_for(dir);
+      off_t sz = lseek(f, 0, SEEK_END);
+      file_size_[dir] = sz < 0 ? 0 : (uint64_t) sz;
+      if (file_size_[dir] < 2 * sizeof(uint32_t)) {
+        n_entries_[dir] = 0;
+        return;
+      }
+      lseek(f, 0, SEEK_SET);
+      uint32_t n = 0, ns = 0;
+      std::ignore = read(f, &n, sizeof(uint32_t));
+      std::ignore = read(f, &ns, sizeof(uint32_t));
+      n_entries_[dir] = n;
+      sampled_offsets_[dir].resize(ns);
+      if (ns)
+        std::ignore = read(f, sampled_offsets_[dir].data(), ns * sizeof(uint64_t));
+
+      // Build histogram by reading the key at each sampled offset.
+      histogram_[dir].clear();
+      histogram_[dir].reserve(ns);
+      for (uint32_t i = 0; i < ns; i++) {
+        lseek(f, sampled_offsets_[dir][i], SEEK_SET);
+        uint32_t id = 0, klen = 0;
+        std::ignore = read(f, &id, sizeof(uint32_t));
+        std::ignore = read(f, &klen, sizeof(uint32_t));
+        Attribute key(klen);
+        if (klen)
+          std::ignore = read(f, key.data(), klen * sizeof(uint32_t));
+        histogram_[dir].push_back(std::move(key));
+      }
+    }
+
+    void load_attrs() override {
+      load_header(PREFIX);
+      strings_.assign(base_n_vectors_, Attribute());
+      max_attrs_ = 0;
+      // Scan all entries sequentially.
+      if (n_entries_[PREFIX] == 0)
+        return;
+      uint64_t data_offset = 2 * sizeof(uint32_t) + sampled_offsets_[PREFIX].size() * sizeof(uint64_t);
+      std::ifstream reader(filename, std::ios::binary);
+      reader.seekg(data_offset);
+      for (uint32_t i = 0; i < n_entries_[PREFIX]; i++) {
+        uint32_t id = 0, klen = 0;
+        reader.read((char *) &id, sizeof(uint32_t));
+        reader.read((char *) &klen, sizeof(uint32_t));
+        Attribute key(klen);
+        if (klen)
+          reader.read((char *) key.data(), klen * sizeof(uint32_t));
+        if (id >= strings_.size())
+          strings_.resize(id + 1);
+        max_attrs_ = std::max(max_attrs_, (size_t) klen);
+        strings_[id] = std::move(key);
+      }
+    }
+
+    void load_approx() override {
+      for (Direction dir : {PREFIX, SUFFIX})
+        load_header(dir);
+      size_t npts, dim;
+      if (file_exists(filename + ".filter"))
+        pipeann::load_bin<uint32_t>(filename + ".filter", hashes_, npts, dim);
+      for (Direction dir : {PREFIX, SUFFIX})
+        load_bucket_approx(dir);
+    }
+
+    void save() override {
+      std::vector<std::pair<Attribute, uint32_t>> entries;
+      entries.reserve(strings_.size());
+      for (uint32_t i = 0; i < (uint32_t) strings_.size(); i++)
+        entries.push_back({strings_[i], i});
+      save_both(entries);
+    }
+
+    // --- Estimation (pure in-memory) ---
+
+    // Coarse range from histogram: returns [lo_sample, hi_sample) indices into sampled_offsets.
+    std::pair<size_t, size_t> get_range(Direction dir, const Attribute &lo, const Attribute &hi) const {
+      auto &h = histogram_[dir];
+      auto l_it = std::lower_bound(h.begin(), h.end(), lo, str_attr_less);
+      if (l_it != h.begin())
+        l_it = std::prev(l_it);
+      auto r_it = hi.empty() ? h.end() : std::lower_bound(h.begin(), h.end(), hi, str_attr_less);
+      return {(size_t) (l_it - h.begin()), (size_t) (r_it - h.begin())};
+    }
+
+    uint32_t estimate_count(const Attribute &query) override {
+      return estimate_count(PREFIX, query);
+    }
+
+    uint32_t estimate_count(Direction dir, const Attribute &query) {
+      if (histogram_[dir].empty())
+        return 0;
+      Attribute lo = dir == PREFIX ? query : reverse_string_attr(query);
+      Attribute hi = next_string_attr_prefix(lo);
+      auto [l, r] = get_range(dir, lo, hi);
+      uint64_t cnt = (r - l) * kSampleRate;
+      // Add delta contribution.
+      for (auto it = delta_[dir].lower_bound(lo);
+           it != delta_[dir].end() && (hi.empty() || str_attr_less(it->first, hi)); ++it)
+        cnt += it->second.size();
+      return (uint32_t) std::min<uint64_t>(cnt, n_vectors.load());
+    }
+
+    uint32_t estimate_count_like(const Attribute &pattern) {
+      Attribute prefix = like_fixed_prefix(pattern);
+      Attribute suffix = like_fixed_suffix(pattern);
+      uint32_t best = (uint32_t) n_vectors.load();
+      if (!prefix.empty())
+        best = std::min(best, estimate_count(PREFIX, prefix));
+      if (!suffix.empty())
+        best = std::min(best, estimate_count(SUFFIX, suffix));
+      return best;
+    }
+
+    double estimate_precision(const Attribute &) override {
+      return 1.0;
+    }
+
+    double estimate_precision(Direction dir, const Attribute &query) {
+      uint32_t tp = estimate_count(dir, query);
+      uint32_t total = estimate_bucket_total(dir, query);
+      if (total == 0)
+        return 1.0;
+      return std::min((double) tp / total, 1.0);
+    }
+
+    uint32_t estimate_bucket_total(Direction dir, const Attribute &query) {
+      if (bucket_boundaries_[dir].empty() || base_n_vectors_ == 0)
+        return 0;
+      Attribute lo = dir == PREFIX ? query : reverse_string_attr(query);
+      Attribute hi = next_string_attr_prefix(lo);
+      auto l = std::lower_bound(bucket_boundaries_[dir].begin(), bucket_boundaries_[dir].end(), lo, str_attr_less);
+      auto r = hi.empty() ? bucket_boundaries_[dir].end()
+                          : std::lower_bound(bucket_boundaries_[dir].begin(), bucket_boundaries_[dir].end(), hi,
+                                             str_attr_less);
+      int lb = std::max<int>(0, (int) (l - bucket_boundaries_[dir].begin()) - 1);
+      int rb = std::min<int>((int) kBuckets - 1, (int) (r - bucket_boundaries_[dir].begin()) + 1);
+      if (rb < lb)
+        return 0;
+      return (uint32_t) std::min<uint64_t>((uint64_t) (rb - lb + 1) * base_n_vectors_ / kBuckets, n_vectors.load());
+    }
+
+    uint32_t estimate_prefilter_reads(const Attribute &query) override {
+      return estimate_prefilter_reads(PREFIX, query);
+    }
+
+    uint32_t estimate_prefilter_reads(Direction dir, const Attribute &query) {
+      uint32_t cnt = estimate_count(dir, query);
+      uint32_t avg_entry = 2 * sizeof(uint32_t) + std::max<size_t>(max_attrs_, 1) * sizeof(uint32_t);
+      return DIV_ROUND_UP((uint64_t) cnt * avg_entry, SECTOR_LEN);
+    }
+
+    uint32_t estimate_prefilter_reads_like(const Attribute &pattern) {
+      Attribute prefix = like_fixed_prefix(pattern);
+      Attribute suffix = like_fixed_suffix(pattern);
+      uint32_t best = std::numeric_limits<uint32_t>::max() / 2;
+      if (!prefix.empty())
+        best = std::min(best, estimate_prefilter_reads(PREFIX, prefix));
+      if (!suffix.empty())
+        best = std::min(best, estimate_prefilter_reads(SUFFIX, suffix));
+      return best;
+    }
+
+    uint32_t estimate_infilter_reads(const Attribute &) override {
+      return 0;
+    }
+
+    // --- Pre-filter (SSD reads via AlignedFileReader) ---
+
+    // Scan a byte range of entries, calling fn(key, id) for each.
+    template<typename Fn>
+    void scan_range(Direction dir, uint64_t byte_begin, uint64_t byte_end, AlignedFileReader *reader, Fn fn) {
+      if (byte_end <= byte_begin)
+        return;
+      uint64_t aligned_off = byte_begin / SECTOR_LEN * SECTOR_LEN;
+      uint64_t read_len = ROUND_UP(byte_end - aligned_off, SECTOR_LEN);
+      char *buf = nullptr;
+      pipeann::alloc_aligned((void **) &buf, read_len, SECTOR_LEN);
+      std::vector<IORequest> reqs = {IORequest(aligned_off, read_len, buf, aligned_off, byte_end - aligned_off)};
+      auto ctx = reader->get_ctx();
+      reader->read_fd(fd_for(dir), reqs, ctx);
+
+      size_t off = byte_begin - aligned_off;
+      size_t limit = byte_end - aligned_off;
+      while (off + 2 * sizeof(uint32_t) <= limit) {
+        uint32_t id = 0, klen = 0;
+        std::memcpy(&id, buf + off, sizeof(uint32_t));
+        std::memcpy(&klen, buf + off + sizeof(uint32_t), sizeof(uint32_t));
+        size_t entry_bytes = 2 * sizeof(uint32_t) + (size_t) klen * sizeof(uint32_t);
+        if (off + entry_bytes > limit)
+          break;
+        const uint32_t *key_ptr = reinterpret_cast<const uint32_t *>(buf + off + 2 * sizeof(uint32_t));
+        fn(key_ptr, klen, id);
+        off += entry_bytes;
+      }
+      pipeann::aligned_free(buf);
+    }
+
+    // Get byte range [begin, end) covering entries in [lo_key, hi_key).
+    std::pair<uint64_t, uint64_t> byte_range_for(Direction dir, const Attribute &lo, const Attribute &hi) const {
+      auto &h = histogram_[dir];
+      auto &so = sampled_offsets_[dir];
+      if (h.empty() || so.empty())
+        return {0, 0};
+      // Find first sample >= lo.
+      auto l_it = std::lower_bound(h.begin(), h.end(), lo, str_attr_less);
+      size_t l_idx = l_it == h.begin() ? 0 : (size_t) (l_it - h.begin() - 1);
+      // Find first sample >= hi.
+      size_t r_idx;
+      if (hi.empty()) {
+        r_idx = so.size();  // to end of file
+      } else {
+        auto r_it = std::lower_bound(h.begin(), h.end(), hi, str_attr_less);
+        r_idx = (size_t) (r_it - h.begin());
+        if (r_idx < so.size())
+          r_idx++;  // include one past to be safe
+      }
+      uint64_t begin = so[l_idx];
+      uint64_t end = r_idx >= so.size() ? file_size_[dir] : so[r_idx];
+      return {begin, end};
+    }
+
+    VectorIDList pre_filter(const Attribute &query, AlignedFileReader *reader) override {
+      return pre_filter(PREFIX, query, reader);
+    }
+
+    VectorIDList pre_filter(Direction dir, const Attribute &query, AlignedFileReader *reader) {
+      Attribute lo = dir == PREFIX ? query : reverse_string_attr(query);
+      Attribute hi = next_string_attr_prefix(lo);
+      auto [begin, end] = byte_range_for(dir, lo, hi);
+
+      VectorIDList result;
+      if (begin < end) {
+        scan_range(dir, begin, end, reader, [&](const uint32_t *key_ptr, uint32_t klen, uint32_t id) {
+          // Check if key is in [lo, hi).
+          Attribute key(key_ptr, key_ptr + klen);
+          if (!str_attr_less(key, lo) && (hi.empty() || str_attr_less(key, hi)))
+            result.push_back(id);
+        });
+      }
+
+      // Merge delta.
+      delta_attrs_mu_.lock_shared();
+      for (auto it = delta_[dir].lower_bound(lo);
+           it != delta_[dir].end() && (hi.empty() || str_attr_less(it->first, hi)); ++it) {
+        for (uint32_t id : it->second)
+          result.push_back(id);
+      }
+      delta_attrs_mu_.unlock_shared();
+
+      std::sort(result.begin(), result.end());
+      result.erase(std::unique(result.begin(), result.end()), result.end());
+      return result;
+    }
+
+    VectorIDList pre_filter_like(const Attribute &pattern, AlignedFileReader *reader) {
+      std::string_view pat = string_attr_view(pattern);
+      Direction dir = PREFIX;
+      Attribute range_key;
+      if (!pat.empty() && pat.front() != '%' && pat.front() != '_') {
+        range_key = like_fixed_prefix(pattern);
+        dir = PREFIX;
+      } else if (!pat.empty() && pat.back() != '%' && pat.back() != '_') {
+        range_key = reverse_string_attr(like_fixed_suffix(pattern));
+        dir = SUFFIX;
+      }
+
+      Attribute hi = range_key.empty() ? Attribute() : next_string_attr_prefix(range_key);
+      auto [begin, end] =
+          range_key.empty()
+              ? std::make_pair((uint64_t) (2 * sizeof(uint32_t) + sampled_offsets_[dir].size() * sizeof(uint64_t)),
+                               file_size_[dir])
+              : byte_range_for(dir, range_key, hi);
+
+      VectorIDList result;
+      scan_range(dir, begin, end, reader, [&](const uint32_t *key_ptr, uint32_t klen, uint32_t id) {
+        Attribute key(key_ptr, key_ptr + klen);
+        Attribute original = dir == PREFIX ? key : reverse_string_attr(key);
+        if (like_match(string_attr_view(original), pat))
+          result.push_back(id);
+      });
+
+      // Delta scan (bounded).
+      delta_attrs_mu_.lock_shared();
+      auto d_begin = range_key.empty() ? delta_[PREFIX].begin() : delta_[PREFIX].lower_bound(range_key);
+      auto d_end = (range_key.empty() || hi.empty()) ? delta_[PREFIX].end() : delta_[PREFIX].lower_bound(hi);
+      for (auto it = d_begin; it != d_end; ++it) {
+        if (like_match(string_attr_view(it->first), pat))
+          result.insert(result.end(), it->second.begin(), it->second.end());
+      }
+      delta_attrs_mu_.unlock_shared();
+
+      std::sort(result.begin(), result.end());
+      result.erase(std::unique(result.begin(), result.end()), result.end());
+      return result;
+    }
+
+    VectorIDList prepare_in_filter(const Attribute &, AlignedFileReader *) override {
+      return VectorIDList();
+    }
+
+    // --- is_member_approx ---
+
+    bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &) override {
+      size_t lock_idx = portable_thread_id();
+      delta_attrs_mu_.lock_shared(lock_idx);
+      bool ret = target_id < hashes_.size() && hashes_[target_id] == hash_packed(query);
+      delta_attrs_mu_.unlock_shared(lock_idx);
+      return ret;
+    }
+
+    bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &, Direction dir) {
+      if (target_id >= bucket_ids_[dir].size() || bucket_boundaries_[dir].empty())
+        return true;
+      Attribute lo = dir == PREFIX ? query : reverse_string_attr(query);
+      Attribute hi = next_string_attr_prefix(lo);
+      auto l = std::lower_bound(bucket_boundaries_[dir].begin(), bucket_boundaries_[dir].end(), lo, str_attr_less);
+      auto r = hi.empty() ? bucket_boundaries_[dir].end()
+                          : std::lower_bound(bucket_boundaries_[dir].begin(), bucket_boundaries_[dir].end(), hi,
+                                             str_attr_less);
+      int lb = std::max<int>(0, (int) (l - bucket_boundaries_[dir].begin()) - 1);
+      int rb = std::min<int>((int) kBuckets - 1, (int) (r - bucket_boundaries_[dir].begin()) + 1);
+      uint32_t bid = bucket_ids_[dir][target_id];
+      return (int) bid >= lb && (int) bid <= rb;
+    }
+
+    // --- Insert / Merge ---
+
+    void insert(uint32_t vector_id, const Attribute &attr) override {
+      delta_attrs_mu_.lock();
+      delta_[PREFIX][attr].push_back(vector_id);
+      delta_[SUFFIX][reverse_string_attr(attr)].push_back(vector_id);
+      delta_bytes_ += 2 * sizeof(uint32_t) + attr.size() * sizeof(uint32_t);
+      atomic_max(n_vectors, (uint64_t) vector_id + 1);
+      max_attrs_ = std::max(max_attrs_, attr.size());
+      if (vector_id >= hashes_.size())
+        hashes_.resize(std::max<size_t>(1024, (size_t) (1.5 * (vector_id + 1))));
+      hashes_[vector_id] = hash_packed(attr);
+      ensure_bucket_id(PREFIX, vector_id, attr);
+      if (unlikely(delta_bytes_ >= 4 * 1024 * 1024))
+        do_merge(libcuckoo::cuckoohash_map<uint32_t, uint32_t>());
+      delta_attrs_mu_.unlock();
+    }
+
+    void merge(const libcuckoo::cuckoohash_map<uint32_t, uint32_t> &id_map) override {
+      delta_attrs_mu_.lock();
+      do_merge(id_map);
+      delta_attrs_mu_.unlock();
+    }
+
+   private:
+    void ensure_bucket_id(Direction dir, uint32_t vector_id, const Attribute &key) {
+      if (vector_id >= bucket_ids_[dir].size())
+        bucket_ids_[dir].resize(std::max<size_t>(1024, (size_t) (1.5 * (vector_id + 1))));
+      if (bucket_boundaries_[dir].empty())
+        return;
+      auto it = std::upper_bound(bucket_boundaries_[dir].begin(), bucket_boundaries_[dir].end(), key, str_attr_less);
+      bucket_ids_[dir][vector_id] = (uint32_t) std::min<size_t>(
+          it == bucket_boundaries_[dir].begin() ? 0 : (it - bucket_boundaries_[dir].begin() - 1), kBuckets - 1);
+    }
+
+    // Write sorted entries to one direction file.
+    void write_sorted_file(Direction dir, std::vector<std::pair<Attribute, uint32_t>> &entries) {
+      std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+        if (str_attr_less(a.first, b.first))
+          return true;
+        if (str_attr_less(b.first, a.first))
+          return false;
+        return a.second < b.second;
+      });
+
+      uint32_t n = entries.size();
+      uint32_t ns = (n + kSampleRate - 1) / kSampleRate;  // number of sampled offsets
+      uint64_t header_size = 2 * sizeof(uint32_t) + ns * sizeof(uint64_t);
+
+      // Compute byte offsets of each entry.
+      std::vector<uint64_t> entry_offsets(n);
+      uint64_t cur = header_size;
+      for (uint32_t i = 0; i < n; i++) {
+        entry_offsets[i] = cur;
+        cur += 2 * sizeof(uint32_t) + entries[i].first.size() * sizeof(uint32_t);
+      }
+
+      // Build sampled offsets (every kSampleRate-th entry).
+      sampled_offsets_[dir].resize(ns);
+      for (uint32_t i = 0; i < ns; i++)
+        sampled_offsets_[dir][i] = entry_offsets[(uint64_t) i * kSampleRate];
+
+      // Write via fd (so that the fd stays valid for subsequent reads).
+      int f = fd_for(dir);
+      std::ignore = ftruncate(f, 0);
+      lseek(f, 0, SEEK_SET);
+      std::ignore = write(f, &n, sizeof(uint32_t));
+      std::ignore = write(f, &ns, sizeof(uint32_t));
+      if (ns)
+        std::ignore = write(f, sampled_offsets_[dir].data(), ns * sizeof(uint64_t));
+      for (auto &[key, id] : entries) {
+        uint32_t klen = key.size();
+        std::ignore = write(f, &id, sizeof(uint32_t));
+        std::ignore = write(f, &klen, sizeof(uint32_t));
+        if (klen)
+          std::ignore = write(f, key.data(), klen * sizeof(uint32_t));
+        if (dir == PREFIX)
+          max_attrs_ = std::max(max_attrs_, (size_t) klen);
+      }
+      fsync(f);
+
+      n_entries_[dir] = n;
+      file_size_[dir] = cur;
+
+      // Build histogram.
+      histogram_[dir].clear();
+      histogram_[dir].reserve(ns);
+      for (uint32_t i = 0; i < ns; i++)
+        histogram_[dir].push_back(entries[(uint64_t) i * kSampleRate].first);
+    }
+
+    void rebuild_buckets(Direction dir, const std::vector<std::pair<Attribute, uint32_t>> &entries) {
+      bucket_ids_[dir].assign(n_vectors, 0);
+      bucket_boundaries_[dir].clear();
+      if (entries.empty())
+        return;
+      for (uint32_t b = 0; b <= kBuckets; b++) {
+        size_t idx = std::min<size_t>((uint64_t) b * entries.size() / kBuckets, entries.size() - 1);
+        bucket_boundaries_[dir].push_back(entries[idx].first);
+      }
+      for (size_t i = 0; i < entries.size(); i++) {
+        uint32_t bid = (uint32_t) std::min<size_t>((uint64_t) i * kBuckets / entries.size(), kBuckets - 1);
+        bucket_ids_[dir][entries[i].second] = bid;
+      }
+    }
+
+    void save_bucket_approx(Direction dir) {
+      std::ofstream writer(approx_filename(dir), std::ios::binary | std::ios::trunc);
+      uint32_t nb = bucket_boundaries_[dir].size();
+      writer.write((char *) &nb, sizeof(uint32_t));
+      for (auto &b : bucket_boundaries_[dir]) {
+        uint32_t len = b.size();
+        writer.write((char *) &len, sizeof(uint32_t));
+        if (len)
+          writer.write((char *) b.data(), len * sizeof(uint32_t));
+      }
+      uint32_t n = bucket_ids_[dir].size();
+      writer.write((char *) &n, sizeof(uint32_t));
+      if (n)
+        writer.write((char *) bucket_ids_[dir].data(), n * sizeof(uint32_t));
+      writer.close();
+    }
+
+    void load_bucket_approx(Direction dir) {
+      std::ifstream reader(approx_filename(dir), std::ios::binary);
+      if (!reader.is_open())
+        return;
+      uint32_t nb = 0;
+      reader.read((char *) &nb, sizeof(uint32_t));
+      bucket_boundaries_[dir].resize(nb);
+      for (uint32_t i = 0; i < nb; i++) {
+        uint32_t len = 0;
+        reader.read((char *) &len, sizeof(uint32_t));
+        bucket_boundaries_[dir][i].resize(len);
+        if (len)
+          reader.read((char *) bucket_boundaries_[dir][i].data(), len * sizeof(uint32_t));
+      }
+      uint32_t n = 0;
+      reader.read((char *) &n, sizeof(uint32_t));
+      bucket_ids_[dir].resize(n);
+      if (n)
+        reader.read((char *) bucket_ids_[dir].data(), n * sizeof(uint32_t));
+    }
+
+    void save_both(std::vector<std::pair<Attribute, uint32_t>> &entries) {
+      write_sorted_file(PREFIX, entries);
+
+      std::vector<std::pair<Attribute, uint32_t>> rev;
+      rev.reserve(entries.size());
+      for (auto &[k, id] : entries)
+        rev.push_back({reverse_string_attr(k), id});
+      write_sorted_file(SUFFIX, rev);
+
+      // Build hashes and bucket approx.
+      hashes_.assign(n_vectors, 0);
+      for (auto &[k, id] : entries)
+        hashes_[id] = hash_packed(k);
+      pipeann::save_bin<uint32_t>(filename + ".filter", hashes_.data(), n_vectors, 1);
+
+      rebuild_buckets(PREFIX, entries);
+      rebuild_buckets(SUFFIX, rev);
+      for (Direction dir : {PREFIX, SUFFIX})
+        save_bucket_approx(dir);
+
+      base_n_vectors_ = n_vectors;
+    }
+
+    void do_merge(const libcuckoo::cuckoohash_map<uint32_t, uint32_t> &id_map) {
+      // Re-read existing entries from prefix file.
+      std::vector<std::pair<Attribute, uint32_t>> entries;
+      if (n_entries_[PREFIX] > 0) {
+        uint64_t data_offset = 2 * sizeof(uint32_t) + sampled_offsets_[PREFIX].size() * sizeof(uint64_t);
+        std::ifstream reader(filename, std::ios::binary);
+        reader.seekg(data_offset);
+        for (uint32_t i = 0; i < n_entries_[PREFIX]; i++) {
+          uint32_t id = 0, klen = 0;
+          reader.read((char *) &id, sizeof(uint32_t));
+          reader.read((char *) &klen, sizeof(uint32_t));
+          Attribute key(klen);
+          if (klen)
+            reader.read((char *) key.data(), klen * sizeof(uint32_t));
+          uint32_t nid = 0;
+          if (id_map.empty()) {
+            entries.push_back({std::move(key), id});
+          } else if (id_map.find(id, nid)) {
+            entries.push_back({std::move(key), nid});
+          }
+        }
+      }
+      // Merge delta.
+      for (auto &[key, ids] : delta_[PREFIX]) {
+        for (uint32_t id : ids) {
+          uint32_t nid = 0;
+          if (id_map.empty()) {
+            entries.push_back({key, id});
+          } else if (id_map.find(id, nid)) {
+            entries.push_back({key, nid});
+          }
+        }
+      }
+      n_vectors = id_map.empty() ? (uint64_t) n_vectors : id_map.size();
+      save_both(entries);
+      for (auto &d : delta_)
+        d.clear();
+      delta_bytes_ = 0;
+    }
+  };
+
   // AttrWriter: Serializes per-vector attributes into the on-SSD graph index layout.
   // During index building, each vector's attributes from all registered AttrIndexes
   // are serialized into an Attributes KV-map and written into the vector's on-SSD record.
@@ -1381,21 +2125,33 @@ namespace pipeann {
   // AttrIndexWriter: Attributes are stored as indexes.
   struct AttrIndexWriter : public AttrWriter {
     std::map<uint32_t, AttrIndex *> attrs_;
+    size_t attr_size_ = 0;         // 0 = infer a tight per-row bound (see attr_size()).
+    size_t computed_attr_size_ = 0;  // cached result of the inferred bound (0 = not yet computed).
 
     AttrIndexWriter() = default;
-    AttrIndexWriter(const std::map<uint32_t, AttrIndex *> &attrs) : attrs_(attrs) {
+    AttrIndexWriter(const std::map<uint32_t, AttrIndex *> &attrs, size_t attr_size = 0)
+        : attrs_(attrs), attr_size_(attr_size) {
     }
     virtual ~AttrIndexWriter() = default;
 
     virtual void write(uint32_t id, void *buffer) override {
+      memset(buffer, 0, attr_size());
       Attributes id_attrs;
       for (auto &[key, attr] : attrs_) {
         id_attrs.set(key, attr->get(id));
+      }
+      if (unlikely(id_attrs.serialized_size() > attr_size())) {
+        LOG(ERROR) << "Attribute size " << attr_size() << " is smaller than serialized attribute size "
+                   << id_attrs.serialized_size();
+        return;
       }
       id_attrs.serialize((char *) buffer);
     }
 
     virtual size_t attr_size() override {
+      if (attr_size_ != 0) {
+        return attr_size_;
+      }
       size_t cnt = 1;  // n_keys
       for (auto &[key, attr] : attrs_) {
         cnt += 2 + attr->max_attrs();  // 1 for key, 1 for attr count, max_attrs() for attrs.
@@ -1410,18 +2166,38 @@ namespace pipeann {
     const std::vector<Attributes> &attrs_vec;
     size_t attr_size_;
 
-    explicit AttrVecWriter(const std::vector<Attributes> &v) : attrs_vec(v) {
-      attr_size_ = 4;
-      for (const auto &attrs : attrs_vec) {
-        attr_size_ = std::max(attr_size_, attrs.serialized_size());
+    explicit AttrVecWriter(const std::vector<Attributes> &v, size_t attr_size = 0) : attrs_vec(v) {
+      attr_size_ = attr_size;
+      if (attr_size_ == 0) {
+        attr_size_ = 4;
+        for (const auto &attrs : attrs_vec) {
+          attr_size_ = std::max(attr_size_, attrs.serialized_size());
+        }
       }
     }
 
     void write(uint32_t id, void *buffer) override {
       memset(buffer, 0, attr_size_);
+      if (unlikely(attrs_vec[id].serialized_size() > attr_size_)) {
+        LOG(ERROR) << "Attribute size " << attr_size_ << " is smaller than serialized attribute size "
+                   << attrs_vec[id].serialized_size();
+        return;
+      }
       attrs_vec[id].serialize(static_cast<char *>(buffer));
     }
 
+    size_t attr_size() override {
+      return attr_size_;
+    }
+  };
+
+  struct ZeroAttrWriter : AttrWriter {
+    size_t attr_size_;
+    explicit ZeroAttrWriter(size_t attr_size) : attr_size_(attr_size) {
+    }
+    void write(uint32_t, void *buffer) override {
+      memset(buffer, 0, attr_size_);
+    }
     size_t attr_size() override {
       return attr_size_;
     }
@@ -1434,22 +2210,24 @@ namespace pipeann {
     return filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
   }
 
-  inline AttrIndex *load_attr_index_from_file(const std::string &filename, const std::string &attr_type,
-                                              uint64_t n_vectors) {
+  inline AttrIndex *create_empty_attr_index(const std::string &filename, const std::string &attr_type,
+                                            uint64_t n_vectors) {
     if (attr_type == "label") {
-      auto *attr_index = new InvertedLabelAttrIndex(filename, n_vectors);
-      attr_index->load_approx();
-      return attr_index;
+      return new InvertedLabelAttrIndex(filename, n_vectors);
     }
     if (attr_type == "range") {
-      auto *attr_index = new SortedRangeAttrIndex(filename, n_vectors);
-      attr_index->load_approx();
-      return attr_index;
+      return new SortedRangeAttrIndex(filename, n_vectors);
     }
-    throw std::runtime_error("attr_type must be 'label' or 'range'");
+    if (attr_type == "string") {
+      return new StringAttrIndex(filename, n_vectors);
+    }
+    throw std::runtime_error("attr_type must be 'label', 'range', or 'string'");
   }
 
   inline std::string native_attr_type(const AttrIndex *attr_index) {
+    if (dynamic_cast<const StringAttrIndex *>(attr_index) != nullptr) {
+      return "string";
+    }
     if (dynamic_cast<const InvertedLabelAttrIndex *>(attr_index) != nullptr) {
       return "label";
     }
@@ -1459,89 +2237,74 @@ namespace pipeann {
     throw std::runtime_error("Unknown native attr index type");
   }
 
-  // Load base attr indexes from config JSON.
-  // Base attrs only need histogram loaded (for estimation), not full data in memory.
-  inline std::map<uint32_t, AttrIndex *> load_base_attr_from_config(const std::string &config_path,
-                                                                    uint64_t n_vectors) {
-    std::ifstream config_file(config_path);
-    if (!config_file.is_open()) {
-      LOG(ERROR) << "Failed to open config file: " << config_path;
-      exit(-1);
-    }
+  // Field descriptor extracted from a unified schema config.
+  // The actual AttrIndex pointer is owned by the caller (stored in base_stores).
+  struct FieldDescriptor {
+    std::string name;
+    uint32_t key = 0;
+    std::string type;  // "label" | "range" | "string"
+    AttrIndex *attr_index = nullptr;
+  };
 
-    picojson::value config;
-    std::string err = picojson::parse(config, config_file);
-    if (!err.empty()) {
-      LOG(ERROR) << "Failed to parse config JSON: " << err;
-      exit(-1);
-    }
-
-    std::map<uint32_t, AttrIndex *> attr_indexes;
-    const auto &root = config.get<picojson::object>();
-    const auto &base_array = root.at("base").get<picojson::array>();
-
-    for (const auto &item : base_array) {
-      const auto &obj = item.get<picojson::object>();
-      uint32_t key = static_cast<uint32_t>(obj.at("key").get<double>());
-      std::string type = obj.at("type").get<std::string>();
-      std::string file = obj.at("file").get<std::string>();
-      attr_indexes[key] = load_attr_index_from_file(file, type, n_vectors);
-    }
-
-    return attr_indexes;
-  }
-
-  // Load query attrs from file into a vector (one Attribute per query)
-  inline void load_query_attrs_from_file(const std::string &file, const std::string &type, uint32_t key,
-                                         std::vector<Attributes> &query_attrs) {
+  // Decode a sparse-matrix file into one Attribute per row, applying the row
+  // decoding convention for the given attribute type:
+  //   - "label": collect indices[j] where data[j] != 0
+  //   - "range": collect data[j] values verbatim (typically [lo, hi))
+  // Throws on unsupported type or non-.spmat suffix.
+  inline std::vector<Attribute> decode_spmat_rows(const std::string &file, const std::string &type) {
     if (type != "label" && type != "range") {
-      LOG(ERROR) << "Unknown attr type in config: " << type;
-      exit(-1);
+      throw std::runtime_error("decode_spmat_rows: unsupported type '" + type + "'");
     }
-
-    if (!query_attrs.empty() && query_attrs[0].find(key)) {
-      return;
-    }
-
     if (!is_suffix(file, ".spmat")) {
-      LOG(ERROR) << "Only .spmat files are supported for query attributes";
-      exit(-1);
+      throw std::runtime_error("decode_spmat_rows: only .spmat files are supported, got: " + file);
     }
-
     auto [nrow, indptr, indices, data] = load_spmat(file);
-    if (query_attrs.empty()) {
-      query_attrs.resize(nrow);
-    }
-
+    std::vector<Attribute> rows(nrow);
     for (int64_t i = 0; i < nrow; i++) {
       Attribute row_attr;
       int64_t start = indptr[i];
       int64_t end = indptr[i + 1];
       for (int64_t j = start; j < end; j++) {
         if (type == "label") {
-          // For label attrs, x[i][j] != 0 means vector i contains indices[j].
           if (data[j] != 0.0f) {
             row_attr.push_back(static_cast<uint32_t>(indices[j]));
           }
-        } else if (type == "range") {
-          row_attr.push_back(data[j]);
+        } else {  // range
+          row_attr.push_back(static_cast<uint32_t>(data[j]));
         }
       }
-      query_attrs[i].set(key, row_attr);
+      rows[i] = std::move(row_attr);
+    }
+    return rows;
+  }
+
+  // Load query attrs from file into a vector (one Attribute per query)
+  inline void load_query_attrs_from_file(const std::string &file, const std::string &type, uint32_t key,
+                                         std::vector<Attributes> &query_attrs) {
+    if (!query_attrs.empty() && query_attrs[0].find(key)) {
+      return;
+    }
+    auto rows = decode_spmat_rows(file, type);
+    int64_t nrow = static_cast<int64_t>(rows.size());
+    if (query_attrs.empty()) {
+      query_attrs.resize(nrow);
+    }
+    for (int64_t i = 0; i < nrow; i++) {
+      query_attrs[i].set(key, std::move(rows[i]));
     }
     LOG(INFO) << "Loaded query attributes from " << file << " (type: " << type << "): " << nrow << " queries";
   }
 
+  inline AttrIndex *load_attr_index_from_file(const std::string &filename, const std::string &attr_type,
+                                              uint64_t n_vectors) {
+    auto *attr_index = create_empty_attr_index(filename, attr_type, n_vectors);
+    attr_index->load_approx();
+    return attr_index;
+  }
+
   inline void save_attr_index_from_rows(const std::vector<Attribute> &rows, const std::string &file_out,
                                         const std::string &attr_type) {
-    AttrIndex *attr_index = nullptr;
-    if (attr_type == "label") {
-      attr_index = new InvertedLabelAttrIndex(file_out, rows.size());
-    } else if (attr_type == "range") {
-      attr_index = new SortedRangeAttrIndex(file_out, rows.size());
-    } else {
-      throw std::runtime_error("attr_type must be 'label' or 'range'");
-    }
+    AttrIndex *attr_index = create_empty_attr_index(file_out, attr_type, rows.size());
     attr_index->load_from_rows(rows);
     attr_index->save();
     delete attr_index;

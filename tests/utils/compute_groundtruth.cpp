@@ -21,6 +21,7 @@
 #include "distance.h"
 #include "filter/attribute.h"
 #include "filter/selector.h"
+#include "filter/dsl_compiler.h"
 
 #define PARTSIZE 1000000
 #define ALIGNMENT 512
@@ -198,7 +199,7 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, const std::string &l
     reader.close();
   }
 
-  // Load selector and labels from JSON config
+  // Load selector and labels from JSON config (unified SQL-like filter + bindings).
   pipeann::Selector *selector = nullptr;
   std::map<uint32_t, pipeann::AttrIndex *> base_stores;
   std::vector<pipeann::Attributes> query_attrs;
@@ -206,16 +207,12 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, const std::string &l
   if (!label_config_file.empty()) {
     std::cerr << "Loading label config from " << label_config_file << " with " << n_base_points << " base points"
               << std::endl;
+    std::tie(selector, query_attrs, base_stores) = pipeann::dsl::load_filter_from_json(label_config_file, n_base_points);
 
-    base_stores = pipeann::load_base_attr_from_config(label_config_file, n_base_points);
     for (auto &[key, store] : base_stores) {
       store->load_attrs();
       std::cerr << "Loaded base label store key=" << key << std::endl;
     }
-
-    auto ret = pipeann::load_selector_from_config(label_config_file, base_stores);
-    selector = ret.first;
-    query_attrs = std::move(ret.second);
     std::cerr << "Loaded selector with " << query_attrs.size() << " query labels" << std::endl;
   }
 
@@ -322,12 +319,6 @@ int aux_main(int argc, char **argv, pipeann::Metric metric, const std::string &l
   if (tags != nullptr) {
     delete[] tags;
   }
-
-  // Cleanup label resources
-  for (auto &[key, store] : base_stores) {
-    delete store;
-  }
-  delete selector;
 
   return 0;
 }

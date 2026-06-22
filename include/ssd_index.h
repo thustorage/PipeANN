@@ -43,7 +43,7 @@ namespace pipeann {
     std::atomic<uint64_t> cur_id, cur_loc;
 
     SSDIndex(pipeann::Metric m, std::shared_ptr<AlignedFileReader> &file_reader, AbstractNeighbor<T> *nbr = nullptr,
-             bool tags = false, IndexBuildParameters *parameters = nullptr);
+             bool tags = false, IndexBuildParameters *parameters = nullptr, bool enable_tag2id = false);
 
     ~SSDIndex();
 
@@ -138,9 +138,9 @@ namespace pipeann {
     }
 
     // Load compressed data, and obtains the handle to the disk-resident index.
-    // When write is enabled, SPDK is forced to copy the disk index, regardless of marker.
-    // For other io engines, enable_writes do nothing.
-    int load(const char *index_prefix, bool enable_writes);
+    // When force_recopy is true, SPDK is forced to copy the disk index regardless of marker.
+    // For other io engines, force_recopy does nothing.
+    int load(const char *index_prefix, bool force_recopy = false);
 
     // Load the companion nav graph at {mem_index_path} (SSD-format disk file) into mem_index_.
     void load_mem_index(const std::string &mem_index_path);
@@ -160,6 +160,16 @@ namespace pipeann {
     size_t coro_search(T **queries, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
                        TagT **res_tags, float **res_dists, const uint64_t beam_width, int N);
 
+    // Optional sink for returning matched nodes' payload (vector coords + decoded
+    // attrs) from a search, keyed by tag. Used by the Milvus layer to serve
+    // output_fields without a second disk read. nullptr (the default) => no
+    // payload is collected and the search path is unchanged.
+    struct NodePayload {
+      std::vector<T> coords;     // data_dim floats (the raw vector)
+      Attributes attrs;          // node's on-disk filterable scalar attributes
+    };
+    using NodeOut = tsl::robin_map<TagT, NodePayload>;
+
     size_t page_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
                        TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
 
@@ -168,7 +178,9 @@ namespace pipeann {
                        TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
 
     size_t pipe_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
-                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr);
+                       TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr,
+                       NodeOut *node_out = nullptr);
+
 
     // Range search: return every tag whose distance to query is <= range (in user-facing metric).
     // Early stop when all vectors with PQ_distance > kRangeEarlyStopFactor * range are explored, may miss some results.
@@ -178,20 +190,20 @@ namespace pipeann {
 
     size_t spec_filter_search(const T *query, const uint64_t k_search, const uint64_t l_search, Selector *selector,
                               const Attributes &query_attrs, TagT *res_tags, float *res_dists,
-                              const uint64_t beam_width, QueryStats *stats = nullptr);
+                              const uint64_t beam_width, QueryStats *stats = nullptr, NodeOut *node_out = nullptr);
 
     size_t spec_prefilter_search(const T *query, const uint64_t k_search, const uint64_t l_search, Selector *selector,
                                  const Attributes &query_attrs, TagT *res_tags, float *res_dists,
-                                 const uint64_t beam_width, QueryStats *stats = nullptr);
+                                 const uint64_t beam_width, QueryStats *stats = nullptr, NodeOut *node_out = nullptr);
 
     size_t spec_postfilter_search(const T *query, const uint64_t k_search, const uint64_t l_search,
                                   const uint64_t l_max, Selector *selector, const Attributes &query_attrs,
                                   TagT *res_tags, float *res_dists, const uint64_t beam_width,
-                                  QueryStats *stats = nullptr);
+                                  QueryStats *stats = nullptr, NodeOut *node_out = nullptr);
 
     size_t spec_infilter_search(const T *query, const uint64_t k_search, const uint64_t l_search, const uint64_t l_max,
                                 Selector *selector, const Attributes &query_attrs, TagT *res_tags, float *res_dists,
-                                const uint64_t beam_width, QueryStats *stats = nullptr);
+                                const uint64_t beam_width, QueryStats *stats = nullptr, NodeOut *node_out = nullptr);
 
     int insert_in_place(const T *point, const TagT &tag, const Attributes *attrs = nullptr);
 
@@ -210,6 +222,20 @@ namespace pipeann {
                                std::vector<TagT> *new_tags = nullptr);
 
     void copy_index(const std::string &prefix_in, const std::string &prefix_out);
+
+    TagT id2tag(uint32_t id);
+
+    // Batch-read several nodes' payloads (vector coords + on-disk filterable
+    // attrs) by internal id, using the AlignedFileReader. Used by the Milvus
+    // pure-scalar Query path, which has internal ids (from pre_filter) before
+    // the id2tag translation. Results are inserted into *out keyed by tag.
+    void get_nodes_by_ids(const std::vector<uint32_t> &ids, NodeOut *out);
+
+    // Batch-read node payloads addressed by tag instead of internal id. Resolves
+    // each wanted tag back to an internal id via the id->tag map, then delegates
+    // to get_nodes_by_ids. Used by the Milvus primary-key Query/Get path, which
+    // resolves the pk to a tag through the doc-store but needs the on-disk attrs.
+    void get_nodes_by_tags(const std::vector<TagT> &tags_wanted, NodeOut *out);
 
     // Held exclusive during the final metadata swap in merge_deletes + reload.
     // Acquired in merge_deletes; released in reload. Callers that invoke reload
@@ -280,6 +306,20 @@ namespace pipeann {
     // If ID == tag, then it is not stored.
     libcuckoo::cuckoohash_map<uint32_t, TagT> tags;
 
+    // Optional reverse map: tag -> id, kept in sync with `tags` on every
+    // mutation. Not persisted (rebuilt from `tags` on load). Enables an
+    // O(|wanted|) get_nodes_by_tags instead of a full scan of `tags`; when
+    // enable_tag2id is false, get_nodes_by_tags is unsupported and errors out.
+    // IDs are never reused, so latest-wins is correct. Note: populated only when
+    // a tags file is present (non-equal mapping); equal mapping leaves it empty.
+    bool enable_tag2id = false;
+    libcuckoo::cuckoohash_map<TagT, uint32_t> tag2id_;
+
+    // Mirror a single id->tag mapping into tag2id_ (no-op unless enabled).
+    inline void track_tag2id(uint32_t id, const TagT &tag) {
+      if (enable_tag2id) tag2id_.insert_or_assign(tag, id);
+    }
+
     // Flags.
     bool load_flag = false;    // already loaded.
     bool enable_tags = false;  // support for tags and dynamic indexing
@@ -315,28 +355,27 @@ namespace pipeann {
       InsertContext &operator=(InsertContext &&) = delete;
     };
 
-    void do_beam_search(const T *query, uint32_t mem_L, uint32_t l_search, const uint64_t beam_width,
+    void do_beam_search(const T *query, uint32_t mem_L, uint64_t l_search, const uint64_t beam_width,
                         std::vector<Neighbor> &expanded_nodes_info, QueryStats *stats = nullptr,
                         InsertContext *insert_ctx = nullptr);
 
-    void do_pipe_search(const T *query, uint32_t mem_L, uint32_t l_search, const uint64_t beam_width,
+    void do_pipe_search(const T *query, uint64_t k_search, uint32_t mem_L, uint64_t l_search, const uint64_t beam_width,
                         std::vector<Neighbor> &expanded_nodes_info, QueryStats *stats = nullptr,
-                        InsertContext *insert_ctx = nullptr);
+                        InsertContext *insert_ctx = nullptr, NodeOut *node_out = nullptr);
 
     template<typename SpecFn, typename VerifyFn>
-    void pipe_search_common(const T *query, uint32_t mem_L, uint64_t l_search, uint64_t l_pool, uint64_t beam_width,
-                            uint64_t read_io_size, bool use_dense_nbrs, SpecFn is_member_approx, VerifyFn is_member,
-                            std::vector<Neighbor> &full_retset, QueryStats *stats = nullptr,
-                            InsertContext *insert_ctx = nullptr,
-                            float range_partial = std::numeric_limits<float>::infinity());
+    void pipe_search_common(const T *query, uint64_t k_search, uint32_t mem_L, uint64_t l_search, uint64_t l_pool,
+                            uint64_t beam_width, bool read_pool_for_rerank, bool use_dense_nbrs,
+                            SpecFn is_member_approx, VerifyFn is_member, std::vector<Neighbor> &full_retset,
+                            QueryStats *stats = nullptr, InsertContext *insert_ctx = nullptr,
+                            float range_partial = std::numeric_limits<float>::infinity(),
+                            NodeOut *node_out = nullptr);
 
     // Background I/O thread function.
     void bg_io_thread();
 
     int get_vector_by_id(const uint32_t &id, T *vector);
 
-    // ID, loc, page mapping.
-    TagT id2tag(uint32_t id);
 
     // Deduplicate sorted results and copy top-k to output arrays.
     size_t copy_top_k(const std::vector<Neighbor> &sorted_results, uint64_t k, TagT *res_tags, float *res_dists,

@@ -16,7 +16,9 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <random>
 #include <thread>
+#include <unordered_set>
 #include "utils/tsl/robin_set.h"
 
 namespace pipeann {
@@ -56,8 +58,9 @@ namespace pipeann {
 
   template<typename T, typename TagT>
   SSDIndex<T, TagT>::SSDIndex(pipeann::Metric m, std::shared_ptr<AlignedFileReader> &file_reader,
-                              AbstractNeighbor<T> *nbr_handler, bool tags, IndexBuildParameters *parameters)
-      : reader(file_reader), nbr_handler(nbr_handler), metric(m), enable_tags(tags) {
+                              AbstractNeighbor<T> *nbr_handler, bool tags, IndexBuildParameters *parameters,
+                              bool enable_tag2id)
+      : reader(file_reader), nbr_handler(nbr_handler), metric(m), enable_tag2id(enable_tag2id), enable_tags(tags) {
     this->dist_cmp.reset(pipeann::get_distance_function<T>(m));
 
     if (parameters != nullptr) {
@@ -166,7 +169,7 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  int SSDIndex<T, TagT>::load(const char *index_prefix, bool enable_writes) {
+  int SSDIndex<T, TagT>::load(const char *index_prefix, bool force_recopy) {
     std::string disk_index_file = std::string(index_prefix) + "_disk.index";
     this->disk_index_file = disk_index_file;
 
@@ -185,7 +188,7 @@ namespace pipeann {
     }
 
     this->destroy_buffers();  // in case of re-init.
-    reader->open(disk_index_file, enable_writes, false);
+    reader->open(disk_index_file, force_recopy, false);
     this->init_buffers(params.max_nthreads);
 
     // load page layout.
@@ -199,6 +202,7 @@ namespace pipeann {
     }
 
     load_flag = true;
+
     LOG(INFO) << "SSDIndex loaded successfully.";
     return 0;
   }
@@ -272,6 +276,7 @@ namespace pipeann {
     size_t tag_num, tag_dim;
     std::vector<TagT> tag_v;
     this->tags.clear();
+    if (enable_tag2id) this->tag2id_.clear();
 
     if (!file_exists(tag_file_name)) {
       LOG(INFO) << "Tags file not found. Using equal mapping";
@@ -280,10 +285,12 @@ namespace pipeann {
       LOG(INFO) << "Load tags from existing file: " << tag_file_name;
       pipeann::load_bin<TagT>(tag_file_name, tag_v, tag_num, tag_dim, offset);
       tags.reserve(tag_v.size());
+      if (enable_tag2id) tag2id_.reserve(tag_v.size());
 
 #pragma omp parallel for
       for (size_t i = 0; i < tag_num; ++i) {
         tags.insert_or_assign(i, tag_v[i]);
+        track_tag2id(i, tag_v[i]);
       }
       LOG(INFO) << "Loaded " << tags.size() << " tags";
     }
@@ -415,6 +422,62 @@ namespace pipeann {
     DiskNode<T> node = node_from_page(sector_buf.get(), loc);
     memcpy((void *) vector_coords, (void *) node.coords, meta_.data_dim * sizeof(T));
     return 0;
+  }
+
+  template<typename T, typename TagT>
+  void SSDIndex<T, TagT>::get_nodes_by_ids(const std::vector<uint32_t> &ids, NodeOut *out) {
+    if (out == nullptr || ids.empty()) return;
+    if (!enable_tags) {
+      LOG(INFO) << "Tags are disabled, cannot retrieve node payloads";
+      return;
+    }
+    // Batch-read the nodes' pages via the AlignedFileReader, MAX_N_SECTOR_READS
+    // at a time, reusing a pooled QueryBuffer's sector scratch.
+    QueryBuffer *query_buf = pop_query_buf(nullptr);
+    void *ctx = reader->get_ctx();
+    const size_t batch = MAX_N_SECTOR_READS;
+    for (size_t i = 0; i < ids.size(); i += batch) {
+      size_t n = std::min(batch, ids.size() - i);
+      std::vector<IORequest> reqs;
+      reqs.reserve(n);
+      std::vector<uint32_t> locs(n);
+      for (size_t j = 0; j < n; ++j) {
+        uint32_t loc = id2loc(ids[i + j]);
+        locs[j] = loc;
+        uint64_t pid = loc_sector_no(loc);
+        reqs.push_back(IORequest(pid * SECTOR_LEN, io_size, query_buf->sector_scratch + j * io_size, u_loc_offset(loc),
+                                 meta_.max_node_len, query_buf->sector_scratch));
+      }
+      reader->read(reqs, ctx);
+      for (size_t j = 0; j < n; ++j) {
+        DiskNode<T> node = node_from_page((char *) reqs[j].buf, locs[j]);
+        typename NodeOut::mapped_type payload;
+        payload.coords.assign(node.coords, node.coords + meta_.data_dim);
+        if (meta_.attr_size > 0) payload.attrs = Attributes::deserialize((char *) node.attrs);
+        out->insert(std::make_pair(id2tag(ids[i + j]), std::move(payload)));
+      }
+    }
+    push_query_buf(query_buf);
+  }
+
+  template<typename T, typename TagT>
+  void SSDIndex<T, TagT>::get_nodes_by_tags(const std::vector<TagT> &tags_wanted, NodeOut *out) {
+    if (out == nullptr || tags_wanted.empty()) return;
+
+    if (!enable_tag2id || tag2id_.empty()) {
+      LOG(ERROR) << "get_nodes_by_tags requires a populated tag2id map (enable_tag2id="
+                 << enable_tag2id << ", tag2id size=" << tag2id_.size() << ")";
+      return;
+    }
+
+    std::vector<uint32_t> ids;
+    ids.reserve(tags_wanted.size());
+    uint32_t id;
+    for (auto tag : tags_wanted) {
+      if (tag2id_.find(tag, id)) ids.push_back(id);
+    }
+
+    get_nodes_by_ids(ids, out);
   }
 
   template<typename T, typename TagT>

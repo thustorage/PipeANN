@@ -160,6 +160,13 @@ namespace pipeann {
       }
     }
 
+    void clear() override {
+      data.clear();
+      data.shrink_to_fit();
+      pq_table.destroy_table();
+      this->npoints = 0;
+    }
+
    private:
     // PQ data
     // pq_table.n_chunks = # of chunks ndims is split into

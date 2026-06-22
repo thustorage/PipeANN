@@ -5,6 +5,7 @@
 
 #include "utils/log.h"
 #include "filter/attribute.h"
+#include "filter/dsl_compiler.h"
 #include "nbr/nbr.h"
 #include "utils/timer.h"
 #include "utils.h"
@@ -67,7 +68,7 @@ int search_disk_index(int argc, char **argv) {
   std::unique_ptr<pipeann::SSDIndex<T>> _pFlashIndex(
       new pipeann::SSDIndex<T>(m, reader, nbr_handler, true, &idx_params));
 
-  if (_pFlashIndex->load(index_prefix_path.c_str(), false) != 0) {
+  if (_pFlashIndex->load(index_prefix_path.c_str()) != 0) {
     return -1;
   }
 
@@ -77,8 +78,15 @@ int search_disk_index(int argc, char **argv) {
     _pFlashIndex->load_mem_index(mem_index_path);
   }
 
-  auto base_stores = pipeann::load_base_attr_from_config(label_config_file, _pFlashIndex->meta_.npoints);
-  auto ret = pipeann::load_selector_from_config(label_config_file, base_stores);
+  auto ret = pipeann::dsl::load_filter_from_json(
+      label_config_file, _pFlashIndex->meta_.npoints);
+  auto &selector = std::get<0>(ret);
+  auto &query_attrs = std::get<1>(ret);
+  auto &base_stores = std::get<2>(ret);
+    
+  LOG(INFO) << "Loaded filter from " << label_config_file << "; "
+            << base_stores.size() << " attr indexes, "
+            << query_attrs.size() << " queries";
 
   omp_set_num_threads(num_threads);
 
@@ -95,7 +103,7 @@ int search_disk_index(int argc, char **argv) {
     auto s = std::chrono::high_resolution_clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
     for (int64_t i = 0; i < (int64_t) query_num; i++) {
-      _pFlashIndex->spec_filter_search(query + (i * query_dim), recall_at, L, ret.first, ret.second[i],
+      _pFlashIndex->spec_filter_search(query + (i * query_dim), recall_at, L, selector, query_attrs[i],
                                        query_result_tags[test_id].data() + (i * recall_at),
                                        query_result_dists[test_id].data() + (i * recall_at), (uint64_t) beamwidth,
                                        stats + i);
@@ -202,10 +210,7 @@ int search_disk_index(int argc, char **argv) {
     run_tests(test_id, true);
   }
 
-  delete ret.first;
-  for (auto &[key, store] : base_stores) {
-    delete store;
-  }
+  // Selector + base_stores are leaked; OS reclaims at process exit.
   return 0;
 }
 

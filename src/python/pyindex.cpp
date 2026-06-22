@@ -3,14 +3,14 @@
 #include <pybind11/stl.h>
 
 PyIndexInterface::PyIndexInterface(uint32_t data_dim, const std::string &data_type, pipeann::Metric metric,
-                                   pipeann::IndexBuildParameters *params)
+                                   pipeann::IndexBuildParameters *params, uint32_t attr_size)
     : data_dim_(data_dim), metric_(metric) {
   if (data_type == "float32")
-    impl_.reset(new DynamicIndex<float>(data_dim_, metric_, params));
+    impl_.reset(new DynamicIndex<float>(data_dim_, metric_, params, attr_size));
   else if (data_type == "uint8")
-    impl_.reset(new DynamicIndex<uint8_t>(data_dim_, metric_, params));
+    impl_.reset(new DynamicIndex<uint8_t>(data_dim_, metric_, params, attr_size));
   else if (data_type == "int8")
-    impl_.reset(new DynamicIndex<int8_t>(data_dim_, metric_, params));
+    impl_.reset(new DynamicIndex<int8_t>(data_dim_, metric_, params, attr_size));
   else
     throw std::runtime_error("Unsupported data type: " + data_type);
 }
@@ -28,7 +28,8 @@ void PyIndexInterface::build(const std::string &data_path, const std::string &in
                              uint32_t memory_use_GB, const std::vector<pipeann::Attributes> *attrs_vec,
                              uint32_t range_dense, const std::string &train_query_path, uint32_t R_ood,
                              uint32_t L_ood) {
-  auto *attr_writer = attrs_vec ? new pipeann::AttrVecWriter(*attrs_vec) : nullptr;
+  auto *attr_writer =
+      attrs_vec ? new pipeann::AttrVecWriter(*attrs_vec, dispatch([](auto *p) { return p->attr_size(); })) : nullptr;
   dispatch([&](auto *p) {
     p->build(data_path, index_prefix, tag_file, build_mem_index, max_nbrs, build_L, PQ_bytes, memory_use_GB,
              attr_writer, range_dense, train_query_path, R_ood, L_ood);
@@ -42,6 +43,11 @@ std::shared_ptr<pipeann::AttrIndex> PyIndexInterface::load_attr_index_from_file(
                                                                                 const std::string &filename,
                                                                                 const std::string &attr_type) {
   return dispatch([&](auto *p) { return p->load_attr_index_from_file(key, filename, attr_type); });
+}
+
+std::shared_ptr<pipeann::AttrIndex> PyIndexInterface::create_attr_index(uint32_t key, const std::string &filename,
+                                                                        const std::string &attr_type) {
+  return dispatch([&](auto *p) { return p->create_attr_index(key, filename, attr_type); });
 }
 
 std::tuple<py::array, py::array> PyIndexInterface::search(py::array &queries, uint32_t topk, uint32_t L,
@@ -102,9 +108,36 @@ size_t PyIndexInterface::npoints() const {
   return dispatch([](auto *p) { return p->npoints(); });
 }
 
-std::pair<pipeann::Selector *, std::vector<pipeann::Attributes>> PyIndexInterface::load_filter_from_json(
+pipeann::dsl::CompiledFilter PyIndexInterface::compile_filter(const std::string &json, const py::dict &schema) {
+  pipeann::dsl::Schema cpp_schema;
+  for (auto item : schema) {
+    std::string name = py::cast<std::string>(item.first);
+    auto tup = py::cast<py::tuple>(item.second);
+    if (tup.size() != 3) {
+      throw std::runtime_error("compile_filter schema entry must be (key:int, type:str, attr_index)");
+    }
+    pipeann::dsl::FieldInfo info;
+    info.key = py::cast<uint32_t>(tup[0]);
+    info.type = py::cast<std::string>(tup[1]);
+    auto ai = py::cast<std::shared_ptr<pipeann::AttrIndex>>(tup[2]);
+    info.attr_index = ai.get();
+    info.n_vectors = static_cast<uint32_t>(ai->n_vectors.load());
+    cpp_schema[name] = info;
+  }
+  return dispatch([&](auto *p) { return p->compile_filter(json, cpp_schema); });
+}
+
+std::tuple<pipeann::Selector *, std::vector<pipeann::Attributes>> PyIndexInterface::load_filter_from_json(
     const std::string &config_path) {
   return dispatch([&](auto *p) { return p->load_filter_from_json(config_path); });
+}
+
+py::array PyIndexInterface::filter_only(pipeann::Selector *selector, const pipeann::Attributes &query_attrs,
+                                        size_t limit) {
+  auto tags = dispatch([&](auto *p) { return p->filter_only(selector, query_attrs, limit); });
+  py::array_t<uint32_t> arr(tags.size());
+  std::memcpy(arr.mutable_data(), tags.data(), tags.size() * sizeof(uint32_t));
+  return arr;
 }
 
 std::string PyIndexInterface::to_string() const {

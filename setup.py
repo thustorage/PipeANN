@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -43,11 +44,17 @@ class CMakeBuild(build_ext):
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
         # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
         # from Python.
+        # The Milvus-compatible gRPC server binary is bundled into the package
+        # (pipeann/_bin/) so `pipeann-server` works straight after install.
+        # CMAKE_RUNTIME_OUTPUT_DIRECTORY drops the executable there directly.
+        bindir = extdir / "_bin"
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
+            f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={bindir}{os.sep}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             "-DBUILD_PYTHON_INTERFACE=ON",
+            "-DBUILD_MILVUS_SERVER=ON",
             "-DUSE_TCMALLOC=OFF",
         ]
         build_args = []
@@ -117,17 +124,36 @@ class CMakeBuild(build_ext):
             ["cmake", ext.sourcedir, *cmake_args], cwd=build_temp, check=True
         )
         subprocess.run(
-            ["cmake", "--build", ".", "--target", ext.name.split(".")[-1], *build_args],
+            [
+                "cmake", "--build", ".",
+                "--target", ext.name.split(".")[-1],
+                "--target", "pipeann_milvus_server",
+                *build_args,
+            ],
             cwd=build_temp,
             check=True,
         )
+
+    def copy_extensions_to_source(self) -> None:
+        # Called for in-place builds (`build_ext --inplace`, used by
+        # `pip install -e .`). The base implementation mirrors each compiled
+        # extension into the source tree; setuptools does not know about the
+        # sibling _bin/ directory, so copy the bundled server binary too.
+        super().copy_extensions_to_source()
+        build_py = self.get_finalized_command("build_py")
+        pkg_dir = Path(build_py.get_package_dir("pipeann"))
+        src_bin = Path(self.build_lib) / "pipeann" / "_bin" / "pipeann_milvus_server"
+        if src_bin.is_file():
+            dst_dir = pkg_dir / "_bin"
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_bin, dst_dir / "pipeann_milvus_server")
 
 
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pipeann",
-    version="0.3.0",
+    version="0.4.0",
     author="Hao Guo",
     author_email="gh23@mails.tsinghua.edu.cn",
     description="Python wrapper for PipeANN",
@@ -136,8 +162,16 @@ setup(
     packages=["pipeann"],
     # Tell setuptools that the root package is in the python directory
     package_dir={"": "."},
+    # Bundle the native gRPC server binary built into pipeann/_bin/.
+    package_data={"pipeann": ["_bin/*"]},
+    include_package_data=True,
     ext_modules=[CMakeExtension("pipeann.C", sourcedir=".")],
     cmdclass={"build_ext": CMakeBuild},
+    entry_points={
+        "console_scripts": [
+            "pipeann-server=pipeann.server:main",
+        ],
+    },
     zip_safe=False,
     python_requires=">=3.7",
 )

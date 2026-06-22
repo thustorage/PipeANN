@@ -29,7 +29,10 @@ namespace pipeann {
     // Scan on-SSD attribute indexes to return a superset of valid vector IDs.
     // May speculatively skip high-selectivity branches (e.g., in AndSelector),
     // deferring exact verification to is_member() during re-ranking.
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) = 0;
+    //
+    // strict=true: never skip branches, return the precise matching set.
+    // Used by filter_only / filter_query (no graph traversal to verify with).
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader, bool strict = false) = 0;
 
     // Exact membership check using full attributes stored in the on-SSD record.
     // Used during re-ranking to verify candidates from speculative filtering.
@@ -75,12 +78,13 @@ namespace pipeann {
       return attr_index_->estimate_prefilter_reads(query_attrs.get(key_));
     }
 
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool /*strict*/ = false) override {
       return attr_index_->pre_filter(query_attrs.get(key_), reader);
     }
 
     virtual bool is_member(uint32_t target_id, const Attributes &query_attrs, const Attributes &target_attrs) override {
-      if (!query_attrs.find(key_) || !target_attrs.find(base_key_)) {
+      if (!target_attrs.find(base_key_)) {
         return false;
       }
       Attribute query_attr = query_attrs.get(key_);
@@ -137,12 +141,13 @@ namespace pipeann {
       return inv_store()->estimate_prefilter_reads_and(query_attrs.get(key_));
     }
 
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool /*strict*/ = false) override {
       return inv_store()->pre_filter_and(query_attrs.get(key_), reader);
     }
 
     virtual bool is_member(uint32_t target_id, const Attributes &query_attrs, const Attributes &target_attrs) override {
-      if (!query_attrs.find(key_) || !target_attrs.find(base_key_)) {
+      if (!target_attrs.find(base_key_)) {
         return false;
       }
       Attribute query_attr = query_attrs.get(key_);
@@ -196,12 +201,13 @@ namespace pipeann {
       return attr_index_->estimate_prefilter_reads(query_attrs.get(key_));
     }
 
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool /*strict*/ = false) override {
       return attr_index_->pre_filter(query_attrs.get(key_), reader);
     }
 
     virtual bool is_member(uint32_t target_id, const Attributes &query_attrs, const Attributes &target_attrs) override {
-      if (!query_attrs.find(key_) || !target_attrs.find(base_key_)) {
+      if (!target_attrs.find(base_key_)) {
         return false;
       }
       Attribute query_attr = query_attrs.get(key_);
@@ -280,11 +286,14 @@ namespace pipeann {
 
     // For pre_filter, skip high-selectivity branches to avoid expensive scans.
     // High-selectivity branches will be verified during exact is_member check later.
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
-      VectorIDList ret = selectors_[0].first->pre_filter(query_attrs, reader);
+    // strict=true forces every branch to be intersected (no skipping); used when
+    // there's no graph-traversal verification stage to recover precision.
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool strict = false) override {
+      VectorIDList ret = selectors_[0].first->pre_filter(query_attrs, reader, strict);
       for (size_t i = 1; i < selectors_.size(); i++) {
-        if (selectors_[i].second <= kHighSelectivityThreshold) {
-          auto cur_set = selectors_[i].first->pre_filter(query_attrs, reader);
+        if (strict || selectors_[i].second <= kHighSelectivityThreshold) {
+          auto cur_set = selectors_[i].first->pre_filter(query_attrs, reader, strict);
           ret = and_sorted_unique(ret, cur_set);
         } else {
           LOG(INFO) << "Skip high-selectivity branch: " << selectors_[i].second;
@@ -389,10 +398,11 @@ namespace pipeann {
       return reads;
     }
 
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool strict = false) override {
       VectorIDList vector_id_set;
       for (auto &selector : selectors_) {
-        auto ret = selector->pre_filter(query_attrs, reader);
+        auto ret = selector->pre_filter(query_attrs, reader, strict);
         vector_id_set = or_sorted_unique(vector_id_set, ret);
       }
       return vector_id_set;
@@ -453,8 +463,9 @@ namespace pipeann {
       return selector_->estimate_prefilter_reads(query_attrs);
     }
 
-    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
-      VectorIDList not_vector_ids = selector_->pre_filter(query_attrs, reader);
+    virtual VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                                    bool strict = false) override {
+      VectorIDList not_vector_ids = selector_->pre_filter(query_attrs, reader, strict);
       VectorIDList vector_ids;
       vector_ids.reserve(n_vectors_ - not_vector_ids.size());
 
@@ -491,80 +502,345 @@ namespace pipeann {
     }
   };
 
-  // Recursively parse query config to build Selector tree and collect query attrs.
-  // query_attrs: out param to collect all loaded attrs by key
-  inline Selector *parse_selector_from_json(const picojson::value &node,
-                                            const std::map<uint32_t, AttrIndex *> &base_stores,
-                                            std::vector<Attributes> &query_attrs) {
-    const auto &obj = node.get<picojson::object>();
-    std::string type = obj.at("type").get<std::string>();
+  // String-equality selector. Backed by StringAttrIndex.
+  //
+  // Query Attribute format (multi-record, supports $eq and $in uniformly):
+  //   [u32 rec0_len_u32][rec0_bytes (rec0_len_u32 words)]
+  //   [u32 rec1_len_u32][rec1_bytes ...]
+  //   ...
+  // Each record is one alternative string. For $eq there is exactly one record;
+  // for $in there are N. Matching is OR across records.
+  //
+  // Target Attribute format (in the on-disk vector record): bare packed bytes
+  // for the single string this vector carries (no length prefix). is_member
+  // exact-compares each query record's bytes against the target bytes.
+  struct StringEqSelector : public Selector {
+    uint32_t key_;
+    uint32_t base_key_;
+    StringAttrIndex *attr_index_;
+    VectorIDList cold_list_;
 
-    if (type == "label" || type == "label_and" || type == "range") {
-      uint32_t key = static_cast<uint32_t>(obj.at("key").get<double>());
-      uint32_t base_key = static_cast<uint32_t>(obj.at("base_key").get<double>());
-      std::string file = obj.at("file").get<std::string>();
-      std::string load_type = (type == "label_and") ? "label" : type;
-      load_query_attrs_from_file(file, load_type, key, query_attrs);
-
-      auto it = base_stores.find(base_key);
-      if (it == base_stores.end()) {
-        LOG(ERROR) << "Base attr index not found for base_key: " << base_key;
-        crash();
+    StringEqSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
+        : key_(key), base_key_(base_key), attr_index_(dynamic_cast<StringAttrIndex *>(attr_index)) {
+      if (attr_index_ == nullptr) {
+        throw std::runtime_error("StringEqSelector requires a StringAttrIndex");
       }
-
-      if (type == "label") {
-        return new LabelOrSelector(key, base_key, it->second);
-      } else if (type == "label_and") {
-        return new LabelAndSelector(key, base_key, it->second);
-      } else /* type == "range" */ {
-        return new RangeSelector(key, base_key, it->second);
-      }
-    } else if (type == "and" || type == "or") {
-      const auto &children = obj.at("children").get<picojson::array>();
-      std::vector<Selector *> selectors;
-      for (const auto &child : children) {
-        selectors.push_back(parse_selector_from_json(child, base_stores, query_attrs));
-      }
-      if (type == "and") {
-        return new AndSelector(std::move(selectors));
-      } else /* type == "or" */ {
-        return new OrSelector(std::move(selectors));
-      }
-    } else if (type == "not") {
-      const auto &child = obj.at("children").get<picojson::array>()[0];
-      return new NotSelector(parse_selector_from_json(child, base_stores, query_attrs),
-                             base_stores.begin()->second->n_vectors);
-    } else {
-      LOG(ERROR) << "Unknown selector type: " << type;
-      return nullptr;
-    }
-  }
-
-  // Load selector and query attrs from config JSON.
-  inline std::pair<Selector *, std::vector<Attributes>> load_selector_from_config(
-      const std::string &config_path, const std::map<uint32_t, AttrIndex *> &base_stores) {
-    std::ifstream config_file(config_path);
-    if (!config_file.is_open()) {
-      LOG(ERROR) << "Failed to open config file: " << config_path;
-      crash();
     }
 
-    picojson::value config;
-    std::string err = picojson::parse(config, config_file);
-    config_file.close();
-    if (!err.empty()) {
-      LOG(ERROR) << "Failed to parse config JSON: " << err;
-      crash();
+    Selector *copy() const override {
+      return new StringEqSelector(key_, base_key_, attr_index_);
     }
 
-    const auto &root = config.get<picojson::object>();
-    const auto &query_node = root.at("query");
+    // Walk multi-record query Attribute, invoking `fn(data_ptr, len_u32)` for
+    // each record. Zero-copy: passes a pointer into q's storage directly.
+    // Callers that need an Attribute can construct one from the pointer.
+    template<typename Fn>
+    static void for_each_record(const Attribute &q, Fn fn) {
+      size_t pos = 0;
+      while (pos < q.size()) {
+        uint32_t rec_len = q[pos];
+        pos++;
+        if (pos + rec_len > q.size())
+          return;
+        fn(q.data() + pos, rec_len);
+        pos += rec_len;
+      }
+    }
 
-    std::vector<Attributes> query_attrs;
-    auto selector = parse_selector_from_json(query_node, base_stores, query_attrs);
-    LOG(INFO) << "Loaded selector from config with " << query_attrs.size() << " queries";
-    return std::make_pair(selector, std::move(query_attrs));
-  }
+    // Convenience: wrap data pointer into an Attribute for callers that need one.
+    static Attribute make_record(const uint32_t *data, uint32_t len) {
+      return Attribute(data, data + len);
+    }
+
+    double estimate_selectivity(const Attributes &query_attrs) override {
+      const Attribute &q = query_attrs.get(key_);
+      double total = 0.0;
+      for_each_record(q, [&](const uint32_t *data, uint32_t len) {
+        auto rec = make_record(data, len);
+        total += (double) attr_index_->estimate_count(rec) / attr_index_->n_vectors;
+      });
+      return std::min(total, 1.0);
+    }
+
+    double estimate_precision(const Attributes &query_attrs) override {
+      const Attribute &q = query_attrs.get(key_);
+      double tp_sum = 0.0, total_sum = 0.0;
+      for_each_record(q, [&](const uint32_t *data, uint32_t len) {
+        auto rec = make_record(data, len);
+        double cnt = attr_index_->estimate_count(rec);
+        double p = attr_index_->estimate_precision(rec);
+        tp_sum += p * cnt;
+        total_sum += cnt;
+      });
+      return tp_sum / total_sum;
+    }
+
+    uint32_t estimate_prefilter_reads(const Attributes &query_attrs) override {
+      uint32_t reads = 0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        reads += attr_index_->estimate_prefilter_reads(make_record(data, len));
+      });
+      return reads;
+    }
+
+    VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                            bool /*strict*/ = false) override {
+      VectorIDList result;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto sub = attr_index_->pre_filter(make_record(data, len), reader);
+        result = or_sorted_unique(result, sub);
+      });
+      return result;
+    }
+
+    bool is_member(uint32_t /*target_id*/, const Attributes &query_attrs, const Attributes &target_attrs) override {
+      if (!target_attrs.find(base_key_))
+        return false;
+      const Attribute &q = query_attrs.get(key_);
+      const Attribute &t = target_attrs.get(base_key_);
+      bool match = false;
+      for_each_record(q, [&](const uint32_t *data, uint32_t len) {
+        if (!match && len == t.size() && memcmp(data, t.data(), len * sizeof(uint32_t)) == 0)
+          match = true;
+      });
+      return match;
+    }
+
+    uint32_t estimate_infilter_reads(const Attributes &query_attrs) override {
+      uint32_t reads = 0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        reads += attr_index_->estimate_infilter_reads(make_record(data, len));
+      });
+      return reads;
+    }
+
+    void prepare_in_filter(const Attributes &query_attrs, AlignedFileReader *reader) override {
+      cold_list_.clear();
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto sub = attr_index_->prepare_in_filter(make_record(data, len), reader);
+        cold_list_ = or_sorted_unique(cold_list_, sub);
+      });
+    }
+
+    bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      if (std::binary_search(cold_list_.begin(), cold_list_.end(), target_id))
+        return true;
+      const Attribute &q = query_attrs.get(key_);
+      bool any = false;
+      for_each_record(q, [&](const uint32_t *data, uint32_t len) {
+        if (!any && attr_index_->is_member_approx(target_id, make_record(data, len), VectorIDList()))
+          any = true;
+      });
+      return any;
+    }
+  };
+
+  struct StringPrefixSelector : public StringEqSelector {
+    StringPrefixSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
+        : StringEqSelector(key, base_key, attr_index) {
+    }
+
+    Selector *copy() const override {
+      return new StringPrefixSelector(key_, base_key_, attr_index_);
+    }
+
+    double estimate_selectivity(const Attributes &query_attrs) override {
+      double total = 0.0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        total += (double) attr_index_->estimate_count(StringAttrIndex::PREFIX, make_record(data, len)) /
+                 attr_index_->n_vectors;
+      });
+      return std::min(total, 1.0);
+    }
+
+    double estimate_precision(const Attributes &query_attrs) override {
+      double tp_sum = 0.0, total_sum = 0.0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto rec = make_record(data, len);
+        double cnt = attr_index_->estimate_count(StringAttrIndex::PREFIX, rec);
+        double p = attr_index_->estimate_precision(StringAttrIndex::PREFIX, rec);
+        tp_sum += cnt;
+        total_sum += p > 0.0 ? cnt / p : cnt;
+      });
+      return std::min(tp_sum / total_sum, 1.0);
+    }
+
+    uint32_t estimate_prefilter_reads(const Attributes &query_attrs) override {
+      uint32_t reads = 0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        reads += attr_index_->estimate_prefilter_reads(StringAttrIndex::PREFIX, make_record(data, len));
+      });
+      return reads;
+    }
+
+    VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader,
+                            bool /*strict*/ = false) override {
+      VectorIDList result;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto sub = attr_index_->pre_filter(StringAttrIndex::PREFIX, make_record(data, len), reader);
+        result = or_sorted_unique(result, sub);
+      });
+      return result;
+    }
+
+    bool is_member(uint32_t, const Attributes &query_attrs, const Attributes &target_attrs) override {
+      if (!target_attrs.find(base_key_))
+        return false;
+      const Attribute &t = target_attrs.get(base_key_);
+      bool match = false;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        if (!match)
+          match = string_attr_starts_with(t, make_record(data, len));
+      });
+      return match;
+    }
+
+    bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      bool any = false;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        if (!any)
+          any = attr_index_->is_member_approx(target_id, make_record(data, len), VectorIDList(),
+                                              StringAttrIndex::PREFIX);
+      });
+      return any;
+    }
+  };
+
+  struct StringSuffixSelector : public StringEqSelector {
+    StringSuffixSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
+        : StringEqSelector(key, base_key, attr_index) {
+    }
+
+    Selector *copy() const override {
+      return new StringSuffixSelector(key_, base_key_, attr_index_);
+    }
+
+    double estimate_selectivity(const Attributes &query_attrs) override {
+      double total = 0.0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        total += (double) attr_index_->estimate_count(StringAttrIndex::SUFFIX, make_record(data, len)) /
+                 attr_index_->n_vectors;
+      });
+      return std::min(total, 1.0);
+    }
+
+    double estimate_precision(const Attributes &query_attrs) override {
+      double tp_sum = 0.0, total_sum = 0.0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto rec = make_record(data, len);
+        double cnt = attr_index_->estimate_count(StringAttrIndex::SUFFIX, rec);
+        double p = attr_index_->estimate_precision(StringAttrIndex::SUFFIX, rec);
+        tp_sum += cnt;
+        total_sum += p > 0.0 ? cnt / p : cnt;
+      });
+      return std::min(tp_sum / total_sum, 1.0);
+    }
+
+    uint32_t estimate_prefilter_reads(const Attributes &query_attrs) override {
+      uint32_t reads = 0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        reads += attr_index_->estimate_prefilter_reads(StringAttrIndex::SUFFIX, make_record(data, len));
+      });
+      return reads;
+    }
+
+    VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader, bool = false) override {
+      VectorIDList result;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        result = or_sorted_unique(result, attr_index_->pre_filter(StringAttrIndex::SUFFIX, make_record(data, len), reader));
+      });
+      return result;
+    }
+
+    bool is_member(uint32_t, const Attributes &query_attrs, const Attributes &target_attrs) override {
+      if (!target_attrs.find(base_key_))
+        return false;
+      const Attribute &t = target_attrs.get(base_key_);
+      bool match = false;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        if (!match)
+          match = string_attr_ends_with(t, make_record(data, len));
+      });
+      return match;
+    }
+
+    uint32_t estimate_infilter_reads(const Attributes &) override {
+      return 0;
+    }
+
+    bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      bool any = false;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        if (!any)
+          any = attr_index_->is_member_approx(target_id, make_record(data, len), VectorIDList(),
+                                              StringAttrIndex::SUFFIX);
+      });
+      return any;
+    }
+  };
+
+  struct StringLikeSelector : public StringEqSelector {
+    // Generic LIKE fallback for complex patterns. The query record stores the raw SQL LIKE pattern.
+    StringLikeSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
+        : StringEqSelector(key, base_key, attr_index) {
+    }
+
+    Selector *copy() const override {
+      return new StringLikeSelector(key_, base_key_, attr_index_);
+    }
+
+    double estimate_selectivity(const Attributes &query_attrs) override {
+      double total = 0.0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        total += (double) attr_index_->estimate_count_like(make_record(data, len)) / attr_index_->n_vectors;
+      });
+      return std::min(total, 1.0);
+    }
+
+    double estimate_precision(const Attributes &) override {
+      return 1.0;
+    }
+
+    uint32_t estimate_prefilter_reads(const Attributes &query_attrs) override {
+      uint64_t reads = 0;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        reads += attr_index_->estimate_prefilter_reads_like(make_record(data, len));
+      });
+      return static_cast<uint32_t>(std::min<uint64_t>(reads, std::numeric_limits<uint32_t>::max() / 2));
+    }
+
+    VectorIDList pre_filter(const Attributes &query_attrs, AlignedFileReader *reader, bool = false) override {
+      VectorIDList result;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        auto sub = attr_index_->pre_filter_like(make_record(data, len), reader);
+        result = or_sorted_unique(result, sub);
+      });
+      return result;
+    }
+
+    // disable in-filtering.
+    uint32_t estimate_infilter_reads(const Attributes &) override {
+      return std::numeric_limits<uint32_t>::max() / 2;
+    }
+
+    bool is_member_approx(uint32_t, const Attributes &) override {
+      return true;
+    }
+
+    bool is_member(uint32_t, const Attributes &query_attrs, const Attributes &target_attrs) override {
+      if (!target_attrs.find(base_key_))
+        return false;
+      std::string_view t = string_attr_view(target_attrs.get(base_key_));
+      bool match = false;
+      for_each_record(query_attrs.get(key_), [&](const uint32_t *data, uint32_t len) {
+        if (!match) {
+          Attribute rec(data, data + len);
+          match = StringAttrIndex::like_match(t, string_attr_view(rec));
+        }
+      });
+      return match;
+    }
+  };
 }  // namespace pipeann
 
 #endif  // SELECTOR_H_

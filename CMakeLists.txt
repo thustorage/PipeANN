@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.5)
 project(pipeann)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -7,6 +7,7 @@ set(IO_ENGINE "uring" CACHE STRING "I/O engine: uring, aio, or spdk")
 set_property(CACHE IO_ENGINE PROPERTY STRINGS uring aio spdk)
 option(USE_TCMALLOC "Use tcmalloc allocator" ON)
 option(BUILD_PYTHON_INTERFACE "Build Python interface (requires pybind11)" OFF)
+option(BUILD_MILVUS_SERVER "Build Milvus-compatible gRPC server (requires grpc++)" OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -39,7 +40,7 @@ add_compile_options(
 	-Wno-unused-parameter
 	-Wno-unused-but-set-variable
 )
-add_compile_options(-g -O3 -march=native -mtune=native -ftree-vectorize -funroll-loops -Wl,--no-as-needed)
+add_compile_options(-g -O3 -march=native -mtune=native -ftree-vectorize -funroll-loops)
 
 message(STATUS "Additional definitions: " $ENV{ADDITIONAL_DEFINITIONS})
 add_definitions(
@@ -84,9 +85,12 @@ else()
 	endif()
 endif()
 
+add_library(pipeann_tcmalloc INTERFACE)
 if(USE_TCMALLOC)
 	add_definitions(-DUSE_TCMALLOC)
-	message(STATUS "Using tcmalloc allocator.")
+	target_link_libraries(pipeann_tcmalloc INTERFACE
+		-Wl,--no-as-needed tcmalloc -Wl,--as-needed)
+	message(STATUS "Using tcmalloc allocator (C++ executables only).")
 else()
 	message(STATUS "Building without tcmalloc allocator.")
 endif()
@@ -168,3 +172,7 @@ endif()
 add_subdirectory(src)
 add_subdirectory(tests)
 add_subdirectory(tests/utils)
+
+if(BUILD_MILVUS_SERVER)
+	add_subdirectory(src/server)
+endif()

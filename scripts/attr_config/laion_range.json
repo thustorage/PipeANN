@@ -1,15 +1,14 @@
 {
-    "base": [
+    "attr_indexes": [
         {
+            "name": "width",
             "key": 1,
             "type": "range",
             "file": "/mnt/nvme4/indices/laion/100M.label.1"
         }
     ],
-    "query": {
-        "key": 1,
-        "base_key": 1,
-        "type": "range",
-        "file": "/mnt/nvme/data/laion/metadata_width_query_10k.spmat"
+    "filter": "width = $$query_width",
+    "bindings": {
+        "query_width": "/mnt/nvme/data/laion/metadata_width_query_10k.spmat"
     }
 }

@@ -50,9 +50,11 @@ namespace pipeann {
     // Added search overload that takes L as params, so that we
     // can customize L on a per-query basis without tampering with "IndexBuildParameters"
     std::pair<uint32_t, uint32_t> search(const T *query, const size_t K, const unsigned L, unsigned *indices,
-                                         float *distances = nullptr, QueryStats *stats = nullptr);
+                                         float *distances = nullptr, QueryStats *stats = nullptr,
+                                         const std::vector<uint32_t> *cand_ids = nullptr);
 
-    size_t search_with_tags(const T *query, const size_t K, const unsigned L, TagT *tags, float *distances);
+    size_t search_with_tags(const T *query, const size_t K, const unsigned L, TagT *tags, float *distances,
+                            const std::vector<uint32_t> *cand_ids = nullptr);
 
     // Public Functions for Incremental Support
 

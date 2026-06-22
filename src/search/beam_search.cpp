@@ -20,7 +20,7 @@
 
 namespace pipeann {
   template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::do_beam_search(const T *query1, uint32_t mem_L, uint32_t l_search, const uint64_t beam_width,
+  void SSDIndex<T, TagT>::do_beam_search(const T *query1, uint32_t mem_L, uint64_t l_search, const uint64_t beam_width,
                                          std::vector<Neighbor> &expanded_nodes_info, QueryStats *stats,
                                          InsertContext *insert_ctx) {
     auto diskSearchBegin = std::chrono::high_resolution_clock::now();
@@ -225,7 +225,7 @@ namespace pipeann {
                                         const uint64_t beam_width, QueryStats *stats) {
     std::shared_lock lk(merge_lock);
     std::vector<Neighbor> expanded_nodes_info;
-    this->do_beam_search(query, mem_L, (uint32_t) l_search, beam_width, expanded_nodes_info, stats, nullptr);
+    this->do_beam_search(query, mem_L, l_search, beam_width, expanded_nodes_info, stats, nullptr);
 
     return copy_top_k(expanded_nodes_info, k_search, res_tags, distances);
   }

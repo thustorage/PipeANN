@@ -27,7 +27,13 @@ jobs:
             cmake \
             libaio-dev \
             libeigen3-dev \
-            libopenblas-dev
+            libopenblas-dev \
+            libgrpc++-dev \
+            libprotobuf-dev \
+            protobuf-compiler \
+            protobuf-compiler-grpc \
+            librocksdb-dev \
+            libgoogle-perftools-dev
 
       - name: Build liburing
         run: |
@@ -45,10 +51,7 @@ jobs:
             numpy \
             ninja \
             pytest \
-            qdrant-client \
-            fastapi \
-            uvicorn \
-            langchain-core
+            pymilvus
 
       - name: Build PipeANN
         run: CMAKE_BUILD_PARALLEL_LEVEL=1 python setup.py build_ext --inplace

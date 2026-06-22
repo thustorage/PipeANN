@@ -38,7 +38,7 @@ namespace pipeann {
 
     std::vector<Neighbor> exp_node_info;
     InsertContext insert_ctx(kExpandedNodesFactor * this->params.L, this->aligned_dim);
-    this->do_pipe_search(point1, 0, params.L, params.beam_width, exp_node_info, nullptr, &insert_ctx);
+    this->do_pipe_search(point1, params.L, 0, params.L, params.beam_width, exp_node_info, nullptr, &insert_ctx);
     std::vector<uint32_t> new_nhood;
 
     // SPACEV1B frequently chooses entry_point as a neighbor, which causes contention.
@@ -149,6 +149,7 @@ namespace pipeann {
     target_node.nnbrs = new_nhood.size();
     memcpy(target_node.nbrs, new_nhood.data(), new_nhood.size() * sizeof(uint32_t));
     tags.insert_or_assign(target_id, tag);
+    track_tag2id(target_id, tag);
 
     // write attributes to the target node if provided.
     if (attrs != nullptr && meta_.attr_size > 0) {

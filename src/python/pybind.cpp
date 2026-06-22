@@ -1,5 +1,6 @@
 #include "pyindex.h"
 #include "dynamic_index.h"
+#include "doc_store.h"  // from src/server/
 #include "filter/selector.h"
 #include <limits>
 #include <pybind11/stl.h>
@@ -74,7 +75,7 @@ namespace {
       return python_self().attr("estimate_prefilter_reads")(query_attrs).cast<uint32_t>();
     }
 
-    pipeann::VectorIDList pre_filter(const pipeann::Attributes &query_attrs, AlignedFileReader *) override {
+    pipeann::VectorIDList pre_filter(const pipeann::Attributes &query_attrs, AlignedFileReader *, bool /*strict*/ = false) override {
       py::gil_scoped_acquire gil;
       return python_self().attr("pre_filter")(query_attrs).cast<pipeann::VectorIDList>();
     }
@@ -102,12 +103,75 @@ namespace {
   };
 }  // namespace
 
+// Defined in pycollection.cpp: binds the neutral CollectionStore engine.
+void bind_collection_store(py::module_ &m);
+
 PYBIND11_MODULE(C, m) {
   m.doc() = "PipeANN";
   m.attr("__version__") = "dev";
 
+  bind_collection_store(m);
+
   m.def("_save_attr_index_from_rows", &pipeann::save_attr_index_from_rows, py::arg("rows"), py::arg("file_out"),
         py::arg("attr_type"));
+
+  // RocksDB-backed id<->tag<->document store (shared with the C++ gRPC server).
+  py::class_<pipeann::DocStore>(m, "DocStore")
+      .def(py::init<>())
+      .def("open", &pipeann::DocStore::open, py::arg("dir"), py::call_guard<py::gil_scoped_release>())
+      .def("close", &pipeann::DocStore::close, py::call_guard<py::gil_scoped_release>())
+      .def("is_open", &pipeann::DocStore::is_open)
+      .def("put_batch", &pipeann::DocStore::put_batch, py::arg("rows"),
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_by_tags",
+          [](const pipeann::DocStore &self, const std::vector<uint32_t> &tags) {
+            std::vector<std::string> ids, docs;
+            {
+              py::gil_scoped_release release;
+              self.get_by_tags(tags, ids, docs);
+            }
+            return py::make_tuple(std::move(ids), std::move(docs));
+          },
+          py::arg("tags"))
+      .def(
+          "get_tags_by_ids",
+          [](const pipeann::DocStore &self, const std::vector<std::string> &ids) {
+            std::vector<int64_t> tags;
+            {
+              py::gil_scoped_release release;
+              self.get_tags_by_ids(ids, tags);
+            }
+            return tags;
+          },
+          py::arg("ids"))
+      .def(
+          "get_docs_by_ids",
+          [](const pipeann::DocStore &self, const std::vector<std::string> &ids) {
+            std::vector<std::string> out_ids, docs;
+            {
+              py::gil_scoped_release release;
+              self.get_docs_by_ids(ids, out_ids, docs);
+            }
+            return py::make_tuple(std::move(out_ids), std::move(docs));
+          },
+          py::arg("ids"))
+      .def("delete_by_ids", &pipeann::DocStore::delete_by_ids, py::arg("ids"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("max_tag", &pipeann::DocStore::max_tag, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "scan",
+          [](const pipeann::DocStore &self) {
+            std::vector<uint32_t> tags;
+            std::vector<std::string> ids, docs;
+            {
+              py::gil_scoped_release release;
+              self.scan(tags, ids, docs);
+            }
+            return py::make_tuple(std::move(tags), std::move(ids), std::move(docs));
+          })
+      .def("clear", &pipeann::DocStore::clear, py::call_guard<py::gil_scoped_release>())
+      .def("flush", &pipeann::DocStore::flush, py::call_guard<py::gil_scoped_release>());
 
   py::enum_<pipeann::Metric>(m, "Metric")
       .value("L2", pipeann::Metric::L2)
@@ -223,6 +287,30 @@ PYBIND11_MODULE(C, m) {
            }),
            py::arg("key"), py::arg("base_key"), py::arg("attr_index"));
 
+  py::class_<pipeann::StringEqSelector, pipeann::Selector>(m, "StringEqSelector")
+      .def(py::init([](uint32_t key, uint32_t base_key, const std::shared_ptr<pipeann::AttrIndex> &attr_index) {
+             return new pipeann::StringEqSelector(key, base_key, attr_index.get());
+           }),
+           py::arg("key"), py::arg("base_key"), py::arg("attr_index"));
+
+  py::class_<pipeann::StringPrefixSelector, pipeann::Selector>(m, "StringPrefixSelector")
+      .def(py::init([](uint32_t key, uint32_t base_key, const std::shared_ptr<pipeann::AttrIndex> &attr_index) {
+             return new pipeann::StringPrefixSelector(key, base_key, attr_index.get());
+           }),
+           py::arg("key"), py::arg("base_key"), py::arg("attr_index"));
+
+  py::class_<pipeann::StringSuffixSelector, pipeann::Selector>(m, "StringSuffixSelector")
+      .def(py::init([](uint32_t key, uint32_t base_key, const std::shared_ptr<pipeann::AttrIndex> &attr_index) {
+             return new pipeann::StringSuffixSelector(key, base_key, attr_index.get());
+           }),
+           py::arg("key"), py::arg("base_key"), py::arg("attr_index"));
+
+  py::class_<pipeann::StringLikeSelector, pipeann::Selector>(m, "StringLikeSelector")
+      .def(py::init([](uint32_t key, uint32_t base_key, const std::shared_ptr<pipeann::AttrIndex> &attr_index) {
+             return new pipeann::StringLikeSelector(key, base_key, attr_index.get());
+           }),
+           py::arg("key"), py::arg("base_key"), py::arg("attr_index"));
+
   py::class_<pipeann::AndSelector, pipeann::Selector>(m, "AndSelector").def(py::init([](py::args children) {
     return make_native_children_selector<pipeann::AndSelector>(children);
   }));
@@ -238,8 +326,10 @@ PYBIND11_MODULE(C, m) {
            py::arg("child"), py::arg("n_vectors"));
 
   py::class_<PyIndexInterface>(m, "PyIndex")
-      .def(py::init<uint32_t, std::string, pipeann::Metric>(), py::arg("data_dim"), py::arg("data_type"),
-           py::arg("metric"))
+      .def(py::init([](uint32_t data_dim, const std::string &data_type, pipeann::Metric metric, uint32_t attr_size) {
+             return new PyIndexInterface(data_dim, data_type, metric, nullptr, attr_size);
+           }),
+           py::arg("data_dim"), py::arg("data_type"), py::arg("metric"), py::arg("attr_size") = 0)
       .def("load", &PyIndexInterface::load, py::arg("index_prefix"))
       .def("save", &PyIndexInterface::save, py::arg("index_prefix"))
       .def("build", &PyIndexInterface::build, py::arg("data_path"), py::arg("index_prefix"),
@@ -249,13 +339,30 @@ PYBIND11_MODULE(C, m) {
            py::arg("train_query_path") = std::string(), py::arg("R_ood") = 0, py::arg("L_ood") = 1500)
       .def("load_attr_index_from_file", &PyIndexInterface::load_attr_index_from_file, py::arg("key"),
            py::arg("filename"), py::arg("attr_type"))
+      .def("create_attr_index", &PyIndexInterface::create_attr_index, py::arg("key"), py::arg("filename"),
+           py::arg("attr_type"))
+      .def(
+          "compile_filter",
+          [](PyIndexInterface &self, const std::string &json, const py::dict &schema) {
+            auto cf = self.compile_filter(json, schema);
+            py::dict slot_map;
+            for (const auto &[name, slot] : cf.slot_map) slot_map[py::str(name)] = slot;
+            py::dict var_field_type;
+            for (const auto &[name, t] : cf.var_field_type) var_field_type[py::str(name)] = t;
+            return py::make_tuple(py::cast(cf.selector, py::return_value_policy::take_ownership),
+                                  std::move(cf.attrs_template), slot_map, var_field_type);
+          },
+          py::arg("json"), py::arg("schema"))
       .def(
           "load_filter_from_json",
           [](PyIndexInterface &self, const std::string &config_path) {
-            auto [selector, query_attrs] = self.load_filter_from_json(config_path);
-            return py::make_tuple(py::cast(selector, py::return_value_policy::take_ownership), query_attrs);
+            auto [selector, attrs_vec] = self.load_filter_from_json(config_path);
+            return py::make_tuple(py::cast(selector, py::return_value_policy::take_ownership),
+                                  std::move(attrs_vec));
           },
           py::arg("config_path"))
+      .def("filter_only", &PyIndexInterface::filter_only, py::arg("selector"), py::arg("query_attrs"),
+           py::arg("limit") = 0)
       .def("search", &PyIndexInterface::search, py::arg("queries"), py::arg("topk"), py::arg("L"),
            py::arg("selector") = (pipeann::Selector *) nullptr,
            py::arg("query_attrs") = std::vector<pipeann::Attributes>(),

@@ -133,12 +133,36 @@ selector reference.
 
 Two ways to set up a filter:
 
-**1. Load a C++-native filter from a JSON config:**
+**1. Compile a SQL-like filter (recommended for per-query workflows):**
 ```python
 idx.load(index_prefix)
-selector, query_attrs = idx.load_filter_from_json("config.json")
+tag_index = idx.load_attr_index_from_file(0, "base.label.0", "label")
+range_index = idx.load_attr_index_from_file(1, "base.range.1", "range")
+
+# Schema: field name → (key, type, attr_index).
+schema = {
+    "tags":  (0, "label", tag_index),
+    "width": (1, "range", range_index),
+}
+selector, attrs, slot_map, var_field_type = idx.compile_filter(
+    "tags = 7 and width > 100 and width < 500",
+    schema,
+)
+ids, dists = idx.search(queries, topk=10, L=50, selector=selector, query_attrs=[attrs])
+```
+For literal filters `slot_map` is empty and `attrs` can be passed directly. Use `$$var` placeholders in the filter string to leave slots open for late binding; the easiest way to bind from `.spmat` files is the unified config loader below.
+
+**1b. Load the unified config end-to-end (batch `.spmat` binding):**
+```python
+idx.load(index_prefix)
+selector, query_attrs = idx.load_filter_from_json("filter.json")
 ids, dists = idx.search(queries, topk=10, L=50, selector=selector, query_attrs=query_attrs)
 ```
+The config is the same `{attr_indexes, filter, bindings}` schema documented in
+[C++ Interface — Filtered Search](cpp-interface.md#filtered-search). Each declared
+`attr_indexes` entry is loaded into the index (so subsequent `add()` calls route
+attributes to the right place), and `query_attrs` has one row per query row in
+the bound `.spmat` files.
 
 **2. Compose a native selector in Python:**
 ```python

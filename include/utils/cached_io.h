@@ -99,18 +99,20 @@ class cached_ofstream {
  public:
   cached_ofstream() {
   }
-  cached_ofstream(const std::string &filename, uint64_t cache_size, size_t initial_offset = 0)
-      : cache_size(cache_size), cur_off(0) {
-    open(filename, cache_size, initial_offset);
+  cached_ofstream(const std::string &filename, uint64_t cache_size_, size_t initial_offset = 0)
+      : cache_size(cache_size_), cur_off(0) {
+    open(filename, cache_size_, initial_offset);
   }
-  void open(const std::string &filename, uint64_t cache_size, size_t initial_offset = 0) {
+  void open(const std::string &filename, uint64_t cache_size_, size_t initial_offset = 0) {
     open_file_to_write(writer, filename);
     assert(writer.is_open());
-    assert(cache_size > 0);
+    assert(cache_size_ > 0);
     writer.seekp(initial_offset, writer.beg);
-    cache_buf = new char[cache_size];
+    this->cache_size = cache_size_;
+    cur_off = 0;
+    cache_buf = new char[cache_size_];
     fsize = initial_offset;
-    LOG(INFO) << "Opened: " << filename.c_str() << ", cache_size: " << cache_size;
+    LOG(INFO) << "Opened: " << filename.c_str() << ", cache_size: " << cache_size_;
   }
 
   ~cached_ofstream() {

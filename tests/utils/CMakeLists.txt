@@ -1,3 +1,7 @@
+# All C++ utility executables in this directory get the tcmalloc allocator
+# (no-op when USE_TCMALLOC=OFF). Applies to every target defined below.
+link_libraries(pipeann_tcmalloc)
+
 add_executable(bin_to_fvecs bin_to_fvecs.cpp)
 target_link_libraries(bin_to_fvecs ${PROJECT_NAME})
 

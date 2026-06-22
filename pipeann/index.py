@@ -41,9 +41,14 @@ VALID_DATA_TYPES = frozenset({"float32", "int8", "uint8"})
 class IndexPipeANN:
     """A Python wrapper for the PipeANN index."""
 
-    def __init__(self, data_dim: int, data_type: str = "float32", metric=Metric.L2):
-        """Create an empty index. ``data_type`` is one of ``VALID_DATA_TYPES``."""
-        self._impl = _NativeIndex(int(data_dim), str(np.dtype(data_type)), _Metric(metric))
+    def __init__(self, data_dim: int, data_type: str = "float32", metric=Metric.L2, attr_size: int = 0):
+        """Create an empty index. ``data_type`` is one of ``VALID_DATA_TYPES``.
+
+        ``attr_size`` reserves this many bytes per on-disk node for serialized
+        scalar attributes. ``0`` keeps the old behavior: infer it from build
+        attrs when present.
+        """
+        self._impl = _NativeIndex(int(data_dim), str(np.dtype(data_type)), _Metric(metric), int(attr_size))
 
     def set_index_prefix(self, index_prefix: str) -> None:
         """Set the default on-disk prefix used by save/load helpers."""
@@ -202,16 +207,68 @@ class IndexPipeANN:
         )
         return np.asarray(ids), np.asarray(dists)
 
-    def load_filter_from_json(self, config_path: str) -> tuple[Selector, AttrsVec]:
-        """Load a native C++ filter and its query attributes from config JSON."""
-        selector, query_attrs = self._impl.load_filter_from_json(config_path)
-        return selector, AttrsVec(query_attrs)
-
     def load_attr_index_from_file(
         self, key: int, filename: str | Path, attr_type: str
     ) -> NativeAttrIndex:
-        """Load one native attr index using the current disk index's vector count."""
+        """Load one native attr index using the current index's vector count."""
         return self._impl.load_attr_index_from_file(int(key), str(filename), attr_type)
+
+    def create_attr_index(
+        self, key: int, filename: str | Path, attr_type: str
+    ) -> NativeAttrIndex:
+        """Create and register an empty scalar attr index for streaming inserts."""
+        return self._impl.create_attr_index(int(key), str(filename), attr_type)
+
+    def compile_filter(
+        self, filter_json: str, schema: dict[str, tuple[int, str, NativeAttrIndex]]
+    ) -> tuple[Selector, Attributes, dict[str, int], dict[str, str]]:
+        """Compile a SQL-like filter string into a (Selector, Attributes,
+        slot_map, var_field_type) tuple.
+
+        ``schema`` maps field name → (key, attr_type, attr_index). Caller owns
+        the returned Selector (managed by Python's GC via pybind).
+
+        ``slot_map`` maps ``$$var`` placeholder names to slot indices in
+        ``Attributes``; ``var_field_type`` maps each var to its field type
+        (``"label"`` / ``"range"`` / ``"string"``). Both are empty when the
+        filter uses no placeholders, in which case ``Attributes`` is fully
+        populated and can be passed directly to search.
+        """
+        selector, attrs_impl, slot_map, var_field_type = self._impl.compile_filter(filter_json, schema)
+        return selector, Attributes(attrs_impl), dict(slot_map), dict(var_field_type)
+
+    def load_filter_from_json(
+        self, config_path: str | Path
+    ) -> tuple[Selector, AttrsVec]:
+        """Load a unified filter config and return ``(selector, query_attrs)``.
+
+        Config layout::
+
+            {
+              "attr_indexes": [{"name": ..., "key": ..., "type": ..., "file": ...}, ...],
+              "filter": "<SQL-like filter string, may use $$var placeholders>",
+              "bindings": {var: <path to .spmat with one row per query>}
+            }
+
+        Each declared AttrIndex is loaded into the underlying disk index (kept
+        alive for as long as this index lives). ``query_attrs`` has one row per
+        binding query; pass it directly to :meth:`search`.
+        """
+        selector, native_attrs_vec = self._impl.load_filter_from_json(str(config_path))
+        return selector, AttrsVec(native_attrs_vec)
+
+    def filter_only(
+        self,
+        selector: Selector,
+        query_attrs: Attributes,
+        limit: int = 0,
+    ) -> np.ndarray:
+        """Run pre_filter only; returns a 1-D ``np.uint32`` array of tags.
+
+        ``limit == 0`` means no truncation.
+        """
+        impl = query_attrs._impl if hasattr(query_attrs, "_impl") else query_attrs
+        return self._impl.filter_only(selector, impl, int(limit))
 
     def __repr__(self) -> str:  # pragma: no cover
         return repr(self._impl)

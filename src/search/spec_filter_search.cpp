@@ -23,7 +23,8 @@ namespace pipeann {
   template<typename T, typename TagT>
   size_t SSDIndex<T, TagT>::spec_filter_search(const T *query, const uint64_t k_search, const uint64_t l_search,
                                                Selector *base_selector, const Attributes &query_attrs, TagT *res_tags,
-                                               float *res_dists, const uint64_t beam_width, QueryStats *stats) {
+                                               float *res_dists, const uint64_t beam_width, QueryStats *stats,
+                                               NodeOut *node_out) {
     // In-filter state lives on the selector itself, so each query needs its
     // own cloned selector tree.
     Selector *selector = base_selector->copy();
@@ -98,20 +99,28 @@ namespace pipeann {
     switch (min_filter_type) {
       case PRE_FILTER:
         ret = spec_prefilter_search(query, k_search, l_search, selector, query_attrs, res_tags, res_dists, beam_width,
-                                    stats);
+                                    stats, node_out);
         break;
       case IN_FILTER:
         ret = spec_infilter_search(query, k_search, l_search, in_filter_l_eq, selector, query_attrs, res_tags,
-                                   res_dists, beam_width, stats);
+                                   res_dists, beam_width, stats, node_out);
         break;
       case POST_FILTER:
         ret = spec_postfilter_search(query, k_search, l_search, l_search / selectivity, selector, query_attrs, res_tags,
-                                     res_dists, beam_width, stats);
+                                     res_dists, beam_width, stats, node_out);
         break;
       default:
         break;
     }
     delete selector;
+
+    // The sub-paths tag filter non-members with distance FLT_MAX during exact
+    // is_member rerank, and copy_top_k emits results in ascending distance order,
+    // so any sentinels sit at the tail. Trim ret to the first non-member to drop
+    // the filter-violating padding when fewer than k vectors match.
+    while (ret > 0 && res_dists[ret - 1] >= std::numeric_limits<float>::max()) {
+      ret--;
+    }
 
     if (stats != nullptr) {
       // for preparation, the estimated read is accurate.
@@ -130,7 +139,8 @@ namespace pipeann {
   template<typename T, typename TagT>
   size_t SSDIndex<T, TagT>::spec_prefilter_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                   Selector *selector, const Attributes &query_attrs, TagT *res_tags,
-                                                  float *res_dists, const uint64_t beam_width, QueryStats *stats) {
+                                                  float *res_dists, const uint64_t beam_width, QueryStats *stats,
+                                                  NodeOut *node_out) {
     QueryBuffer *query_buf = pop_query_buf(query1);
     auto ctx = reader->get_ctx();
     const T *query = query_buf->aligned_query<T>();
@@ -215,6 +225,12 @@ namespace pipeann {
         }
         retset[i - N_READS + j].distance = is_member ? dist_cmp->compare(query, node.coords, (unsigned) aligned_dim)
                                                      : std::numeric_limits<float>::max();
+        if (is_member && node_out != nullptr) {
+          NodePayload payload;
+          payload.coords.assign(node.coords, node.coords + meta_.data_dim);
+          if (meta_.attr_size > 0) payload.attrs = std::move(target_attrs);
+          node_out->insert(std::make_pair(id2tag(retset[i - N_READS + j].id), std::move(payload)));
+        }
       }
       prev_reqs.clear();
     };
@@ -243,7 +259,7 @@ namespace pipeann {
   size_t SSDIndex<T, TagT>::spec_postfilter_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                    const uint64_t l_max, Selector *selector,
                                                    const Attributes &query_attrs, TagT *res_tags, float *res_dists,
-                                                   const uint64_t beam_width, QueryStats *stats) {
+                                                   const uint64_t beam_width, QueryStats *stats, NodeOut *node_out) {
     auto always_member = [](unsigned) -> bool { return true; };
     auto verify = [&](unsigned id, const DiskNode<T> &node) -> bool {
       auto target_attrs = Attributes::deserialize((char *) node.attrs);
@@ -256,8 +272,8 @@ namespace pipeann {
     };
 
     std::vector<Neighbor> full_retset;
-    this->pipe_search_common(query1, 0, l_search, l_max, beam_width, io_size, false, always_member, verify, full_retset,
-                             stats, nullptr);
+    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, false, false, always_member, verify, full_retset,
+                             stats, nullptr, std::numeric_limits<float>::infinity(), node_out);
 
     return copy_top_k(full_retset, k_search, res_tags, res_dists);
   }
@@ -266,7 +282,7 @@ namespace pipeann {
   size_t SSDIndex<T, TagT>::spec_infilter_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  const uint64_t l_max, Selector *selector,
                                                  const Attributes &query_attrs, TagT *res_tags, float *res_dists,
-                                                 const uint64_t beam_width, QueryStats *stats) {
+                                                 const uint64_t beam_width, QueryStats *stats, NodeOut *node_out) {
     // Prepare in-filter state (e.g., scan cold attributes).
     Timer prefilter_timer;
     prefilter_timer.reset();
@@ -287,8 +303,8 @@ namespace pipeann {
     };
 
     std::vector<Neighbor> full_retset;
-    this->pipe_search_common(query1, 0, l_search, l_max, beam_width, io_size_dense, true, is_member_approx, verify,
-                             full_retset, stats, nullptr);
+    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, false, true, is_member_approx, verify, full_retset,
+                             stats, nullptr, std::numeric_limits<float>::infinity(), node_out);
 
     return copy_top_k(full_retset, k_search, res_tags, res_dists);
   }

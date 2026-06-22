@@ -506,7 +506,8 @@ namespace pipeann {
 
   template<typename T, typename TagT>
   std::pair<uint32_t, uint32_t> Index<T, TagT>::search(const T *query, const size_t K, const unsigned L,
-                                                       unsigned *indices, float *distances, QueryStats *stats) {
+                                                       unsigned *indices, float *distances, QueryStats *stats,
+                                                       const std::vector<uint32_t> *cand_ids) {
     std::vector<unsigned> init_ids;
     tsl::robin_set<unsigned> visited(10 * L);
     std::vector<Neighbor> best_L_nodes, expanded_nodes_info;
@@ -526,11 +527,19 @@ namespace pipeann {
     } else {
       memcpy(aligned_query, query, _dim * sizeof(T));
     }
-    auto retval = iterate_to_fixed_point(aligned_query, L, init_ids, expanded_nodes_info, expanded_nodes_ids,
-                                         best_L_nodes, stats);
-    if (stats != nullptr) {
-      stats->n_hops = retval.first;
-      stats->n_cmps = retval.second;
+    std::pair<uint32_t, uint32_t> retval{0, 0};
+
+    if (cand_ids != nullptr) {
+      best_L_nodes.reserve(cand_ids->size());
+      for (auto loc : *cand_ids) {
+        best_L_nodes.emplace_back(loc, _distance->compare(aligned_query, _data.data() + (size_t) loc * _dim, _dim),
+                                  true);
+      }
+      std::sort(best_L_nodes.begin(), best_L_nodes.end());
+      retval.second = (uint32_t) best_L_nodes.size();
+    } else {
+      retval = iterate_to_fixed_point(aligned_query, L, init_ids, expanded_nodes_info, expanded_nodes_ids,
+                                      best_L_nodes, stats);
     }
 
     size_t pos = 0;
@@ -544,16 +553,27 @@ namespace pipeann {
       if (pos == K)
         break;
     }
+    for (size_t i = pos; i < K; i++) {
+      indices[i] = std::numeric_limits<unsigned>::max();
+      if (distances != nullptr) {
+        distances[i] = std::numeric_limits<float>::max();
+      }
+    }
+
+    if (stats != nullptr) {
+      stats->n_hops = retval.first;
+      stats->n_cmps = retval.second;
+    }
     aligned_free(aligned_query);
     return retval;
   }
 
   template<typename T, typename TagT>
   size_t Index<T, TagT>::search_with_tags(const T *query, const size_t K, const unsigned L, TagT *tags,
-                                          float *distances) {
+                                          float *distances, const std::vector<uint32_t> *cand_ids) {
     uint32_t *indices = new unsigned[L];
     float *dist_interim = new float[L];
-    search(query, L, L, indices, dist_interim);
+    search(query, L, L, indices, dist_interim, nullptr, cand_ids);
 
     std::shared_lock<std::shared_timed_mutex> ulock(_update_lock);
     std::shared_lock<std::shared_timed_mutex> lock(_tag_lock);
@@ -917,7 +937,7 @@ namespace pipeann {
 
     assert(_final_graph[location].size() <= params.R);
     inter_insert(location, pruned_list, params);
-    return 0;
+    return static_cast<int>(location);
   }
 
   template<typename T, typename TagT>

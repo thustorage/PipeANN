@@ -373,6 +373,7 @@ namespace pipeann {
 
     auto start = std::chrono::high_resolution_clock::now();
     auto p_val = nbr_handler->get_sample_p();
+    nbr_handler->clear(); // free compressed vectors; object stays alive for later load().
     pipeann::build_merged_index<T, TagT>(normalized_file_path, _compareMetric, R, L_or_L1, p_val, M, disk_index_path,
                                          tag_file, R_dense, num_threads, L2, train_query_path, R_ood, L_ood,
                                          attr_writer);

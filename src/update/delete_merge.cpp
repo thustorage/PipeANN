@@ -278,11 +278,13 @@ namespace pipeann {
     delete tmp;
     // tags.
     tags.clear();
+    if (enable_tag2id) tag2id_.clear();
     // no need to clear id2loc & loc2id as they are arrays.
     // out-of-bound loc2id is initialized in reload().
 #pragma omp parallel for num_threads(nthreads)
     for (size_t i = 0; i < new_tags.size(); ++i) {
       tags.insert_or_assign(i, new_tags[i]);
+      track_tag2id(i, new_tags[i]);
       set_id2loc(i, i);
       set_loc2id(i, i);
     }

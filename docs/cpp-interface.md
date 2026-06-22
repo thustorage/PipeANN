@@ -248,16 +248,16 @@ Output:
 1. The graph index on SSD — each record stores `[vector | neighbors | attributes | 2-hop neighbors]` (attributes are used for exact verification).
 2. Separate attribute index files on SSD (e.g., `yfcc10M.label.0` is the inverted label index), used for pre-filter scans. Only PQ-compressed vectors and lightweight probabilistic filters live in memory.
 
-**2. Configure the query.** Create a JSON config that specifies base attribute indexes and the query selector:
+**2. Configure the query.** The config has three sections: `attr_indexes` (base attribute indexes), `filter` (a SQL-like query template), and `bindings` (per-`$$var` query-attribute `.spmat` files). Placeholders use the `$$varName` convention; each placeholder gets one row per query from its bound `.spmat`.
 
 ```json
 {
-    "base": [
-        { "key": 0, "type": "label", "file": "yfcc10M.label.0" }
+    "attr_indexes": [
+        { "name": "tags", "key": 0, "type": "label", "file": "yfcc10M.label.0" }
     ],
-    "query": {
-        "key": 0, "base_key": 0, "type": "label_and",
-        "file": "query.metadata.public.100K.spmat"
+    "filter": "array_contains_all(tags, $$query_tags)",
+    "bindings": {
+        "query_tags": "query.metadata.public.100K.spmat"
     }
 }
 ```
@@ -282,51 +282,37 @@ Abbreviated result on YFCC10M (LabelAnd):
 
 ### JSON Config Reference
 
-The config has two top-level keys: `base` (attribute indexes) and `query` (selector tree).
+| Key | Type | Description |
+|-----|------|-------------|
+| `attr_indexes` | array | Base attribute index definitions built at index time. |
+| `filter` | string | SQL-like filter expression with `$$var` placeholders. |
+| `bindings` | object | Maps each `$$var` to a query-attribute `.spmat` file. |
 
-| Key | Location | Type | Description |
-|-----|----------|------|-------------|
-| `base` | Root | array | Base attribute index definitions built at index time. |
-| `query` | Root | object | Query selector tree — either a leaf or a Boolean node. |
-
-**`base` array item:**
+**`attr_indexes` array item:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `key` | uint32 | Unique identifier; referenced by `base_key` in the query selector. |
-| `type` | string | `"label"` (inverted label index) or `"range"` (numeric range index). |
+| `name` | string | Field name referenced by `filter`. |
+| `key` | uint32 | Slot key in the on-disk vector record; assigned at build time. |
+| `type` | string | `"label"` (inverted label index), `"range"` (numeric range index), or `"string"`. |
 | `file` | string | Path to the attribute index file (output of `build_disk_index_filtered`). |
 
-**`query` leaf selector** (`label` / `label_and` / `range`):
+**`filter` operators.** SQL-like: `=`, `==`, `!=`, `<>`, `>`, `>=`, `<`, `<=`, `in`, `not in`, `between`, `like`, `array_contains`, `array_contains_all`, `array_contains_any`, `and`, `or`, `not`, and parentheses. Placeholders (`$$var`) can appear anywhere a literal value is accepted, including as the second argument to `array_contains_all` / `array_contains_any`.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | `"label"` (OR semantics), `"label_and"` (AND semantics), or `"range"` (`[l, r)`). |
-| `key` | uint32 | Query attribute key. |
-| `base_key` | uint32 | References the `key` of the corresponding `base` entry. |
-| `file` | string | Path to the query attribute file (`.spmat`). |
-
-**`query` Boolean selector** (`and` / `or` / `not`):
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | `"and"`, `"or"`, `"not"`. |
-| `children` | array | Child selectors (leaf or Boolean). |
+**`bindings`.** Each `.spmat` file decodes one Attribute per query row (label: indices where `data != 0`; range: pushes the row's `[lo, hi)` interval). All bound files must share the same row count.
 
 **Complex example — LabelOr OR Range:**
 
 ```json
 {
-    "base": [
-        { "key": 0, "type": "label", "file": "100M.label.0" },
-        { "key": 1, "type": "range", "file": "100M.label.1" }
+    "attr_indexes": [
+        { "name": "tags",  "key": 0, "type": "label", "file": "100M.label.0" },
+        { "name": "width", "key": 1, "type": "range", "file": "100M.label.1" }
     ],
-    "query": {
-        "type": "or",
-        "children": [
-            { "key": 0, "base_key": 0, "type": "label", "file": "metadata_query.spmat" },
-            { "key": 1, "base_key": 1, "type": "range", "file": "metadata_width_query.spmat" }
-        ]
+    "filter": "tags = $$query_tags or width = $$query_width",
+    "bindings": {
+        "query_tags":  "metadata_query.spmat",
+        "query_width": "metadata_width_query.spmat"
     }
 }
 ```

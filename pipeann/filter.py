@@ -14,6 +14,7 @@ from .C import NotSelector as _NotSelector
 from .C import OrSelector as _OrSelector
 from .C import RangeSelector as _RangeSelector
 from .C import Selector as _Selector
+from .C import StringEqSelector as _StringEqSelector
 from .C import _save_attr_index_from_rows
 
 
@@ -179,9 +180,32 @@ else:
     LabelOrSelector = _LabelOrSelector
     LabelAndSelector = _LabelAndSelector
     RangeSelector = _RangeSelector
+    StringEqSelector = _StringEqSelector
     AndSelector = _AndSelector
     OrSelector = _OrSelector
     NotSelector = _NotSelector
+
+
+def pack_string(s: str) -> List[int]:
+    """Pack a UTF-8 string into a packed-bytes Attribute (no length prefix,
+    NUL-padded to a uint32 boundary). Mirrors the C++ side of `string` attr
+    index storage. Embedded NUL bytes are not allowed.
+    """
+    if "\x00" in s:
+        raise ValueError("string attribute cannot contain embedded NUL byte")
+    b = s.encode("utf-8")
+    pad = (-len(b)) % 4
+    b += b"\x00" * pad
+    return [int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)]
+
+
+def unpack_string(packed: Sequence[int]) -> str:
+    """Inverse of ``pack_string``: decode a packed-bytes attribute back to str."""
+    raw = b"".join(int(x).to_bytes(4, "little") for x in packed)
+    end = raw.find(b"\x00")
+    if end != -1:
+        raw = raw[:end]
+    return raw.decode("utf-8")
 
 
 __all__ = [
@@ -195,4 +219,7 @@ __all__ = [
     "OrSelector",
     "RangeSelector",
     "Selector",
+    "StringEqSelector",
+    "pack_string",
+    "unpack_string",
 ]

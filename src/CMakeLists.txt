@@ -32,9 +32,6 @@ elseif(IO_ENGINE STREQUAL "aio")
     target_link_libraries(${PROJECT_NAME} PUBLIC aio)
 endif()
 
-if(USE_TCMALLOC)
-    target_link_libraries(${PROJECT_NAME} PUBLIC tcmalloc)
-endif()
 
 target_link_libraries(${PROJECT_NAME} PUBLIC ${BLAS_LIBRARIES} OpenMP::OpenMP_CXX)
 
@@ -42,7 +39,12 @@ target_link_libraries(${PROJECT_NAME} PUBLIC ${BLAS_LIBRARIES} OpenMP::OpenMP_CX
 # pip install "pybind11[global]"
 if(BUILD_PYTHON_INTERFACE)
     find_package(pybind11 REQUIRED)
+    find_library(ROCKSDB_LIB rocksdb REQUIRED)
     file(GLOB PYBIND_CPP python/*.cpp)
+    # The neutral collection engine is shared with the gRPC server; compile it
+    # into the Python module so MilvusClient drives the same data model.
+    list(APPEND PYBIND_CPP ${CMAKE_CURRENT_SOURCE_DIR}/server/collection_store.cpp)
     pybind11_add_module(C NO_EXTRAS ${PYBIND_CPP})
-    target_link_libraries(C PRIVATE pipeann)
+    target_include_directories(C PRIVATE ${PROJECT_SOURCE_DIR}/src/server)
+    target_link_libraries(C PRIVATE pipeann ${ROCKSDB_LIB})
 endif()

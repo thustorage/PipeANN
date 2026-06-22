@@ -1,11 +1,21 @@
 #ifndef LOCK_TABLE_H_
 #define LOCK_TABLE_H_
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <omp.h>
 #include <shared_mutex>
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "utils/log.h"
+
+// Returns a unique per-thread ID that works both inside OMP parallel regions
+// and from plain std::thread / gRPC worker threads.  The ID is assigned on
+// first call and stays constant for the thread's lifetime.
+inline size_t portable_thread_id() {
+  static std::atomic<size_t> next_id{0};
+  thread_local size_t my_id = next_id.fetch_add(1);
+  return my_id;
+}
 
 inline void thread_pause() {
   // Use pause instruction to reduce contention in tight loops.
@@ -245,7 +255,7 @@ namespace pipeann {
       std::shared_mutex mutex;
       char padding[128 - sizeof(std::shared_mutex)];
     } locks_[N];
-    void lock_shared(size_t idx = omp_get_thread_num()) {
+    void lock_shared(size_t idx = portable_thread_id()) {
       locks_[idx % N].mutex.lock_shared();
     }
     void lock() {
@@ -253,7 +263,7 @@ namespace pipeann {
         locks_[i].mutex.lock();
       }
     }
-    void unlock_shared(size_t idx = omp_get_thread_num()) {
+    void unlock_shared(size_t idx = portable_thread_id()) {
       locks_[idx % N].mutex.unlock_shared();
     }
     void unlock() {

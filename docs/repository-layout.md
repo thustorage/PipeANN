@@ -44,8 +44,9 @@ PipeANN/
 │   │   ├── rabitq_nbr.h / rabitq/     # RaBitQ 1-bit / multi-bit quantization
 │   │   └── dummy_nbr.h                # No-op codec (debug)
 │   ├── filter/                   # Speculative filtering
-│   │   ├── attribute.h                # AttrIndex (label inverted index, range index)
-│   │   ├── selector.h                 # Selector tree (LabelOr/And, Range, And/Or/Not)
+│   │   ├── attribute.h                # AttrIndex (label inverted, range, string-eq) + spmat decode helper
+│   │   ├── selector.h                 # Selector tree (LabelOr/And, Range, StringEq, And/Or/Not)
+│   │   ├── dsl_compiler.h             # SQL-like filter DSL → CompiledFilter; $$var binders
 │   │   └── filter_utils.h             # Shared filter helpers
 │   └── utils/                    # Headers for utilities, containers, logging
 │       ├── pipnn.h, partition.h       # PiPNN build
@@ -65,25 +66,37 @@ PipeANN/
 │   ├── pad_partition.cpp            # Pad partition file (for Starling)
 │   ├── normalize_data.cpp           # Normalize vectors (for cosine/MIPS)
 │   ├── test_cpu.cpp                 # CPU/SIMD sanity check
+│   ├── test_field_codec.cpp         # Scalar field codec unit test (server field_codec.h)
 │   └── utils/                    # Data utilities (vecs_to_bin, gt_update, ...)
+├── proto/                        # gRPC protocol definitions
+│   └── milvus/                      # Milvus wire-protocol .proto files
+├── src/server/                   # Milvus-compatible engine + C++ gRPC server
+│   ├── main.cpp                     # Server entry point (CLI args, gRPC bootstrap)
+│   ├── milvus_server.cpp            # Servicer: Milvus protobuf <-> CollectionStore
+│   ├── milvus_server.h              # Servicer declarations
+│   ├── collection_store.cpp         # CollectionStore engine (schema, build, insert/search/query)
+│   ├── collection_store.h           # CollectionStore + Collection declarations
+│   ├── field_codec.h                # Scalar field encode/decode (incl. order-preserving float)
+│   ├── doc_store.h                  # RocksDB-backed (id, tag, document) store
+│   └── search_worker_pool.h         # Per-thread search worker pool
 ├── tests_py/                     # Python examples & tests
-│   ├── collection_example.py        # Collection API smoke tests
+│   ├── collection_example.py        # MilvusClient (in-process) smoke test
+│   ├── index_example.py             # IndexPipeANN smoke test
 │   ├── test_filter.py               # Python Selector pytest
 │   ├── test_native_selector.py      # Native selector composition pytest
-│   ├── langchain_example.py         # LangChain VectorStore smoke test
-│   ├── qdrant_server_example.py     # Qdrant-compatible server smoke test
+│   ├── test_hybrid_query.py         # Hybrid (vector + scalar) MilvusClient pytest
+│   ├── test_milvus_quickstart.py    # Milvus-compatible API quickstart test
+│   ├── test_grpc_server_e2e.py      # gRPC server end-to-end pytest (pymilvus client)
 │   ├── test_insert_attrs.py         # Filtered build-vs-insert regression check
-│   ├── test_range_search.py         # Range-search smoke test
+│   ├── test_insert_search.py        # Insert-then-search regression check
+│   └── test_range_search.py         # Range-search smoke test
 ├── pipeann/                      # Python package
 │   ├── __init__.py                  # Re-export public Python API
-│   ├── client.py                    # Client (multi-collection manager, disk auto-discovery)
-│   ├── collection.py                # Collection (document + metadata layer, schema.json persistence)
 │   ├── filter.py                    # Attributes, AttrsVec, Selector
 │   ├── index.py                     # IndexPipeANN, Metric, VALID_DATA_TYPES
-│   ├── langchain.py                 # LangChain VectorStore integration
-│   └── qdrant_server.py             # Qdrant-compatible HTTP server for Open WebUI
+│   └── milvus.py                    # Milvus-compatible MilvusClient (in-process, native CollectionStore)
 ├── scripts/                      # Evaluation scripts
-└── third_party/                  # Dependencies (liburing)
+└── third_party/                  # Dependencies (liburing, spdk)
 ```
 
 ## Evaluation Scripts
@@ -138,6 +151,7 @@ scripts/
 │   ├── fig6.sh ~ fig12.sh           # Paper figure reproduction
 │   └── plotting.ipynb               # Jupyter notebook for plotting
 ├── run_all_pipeann.sh               # Run all PipeANN experiments
+├── bench_milvus_vs_pipeann.py       # SIFT1M benchmark: PipeANN gRPC vs Milvus (same MilvusClient)
 └── validate_index_structure.py      # Index validation tool
 ```
 

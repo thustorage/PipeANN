@@ -242,7 +242,7 @@ namespace pipeann {
       dists = new float[npts * dim];
       reader.read((char *) dists, npts * dim * sizeof(float));
     }
-    if (truthset_type == 3) {
+    if (truthset_type == 3 && tags != nullptr) {
       *tags = new uint32_t[npts * dim];
       reader.read((char *) *tags, npts * dim * sizeof(uint32_t));
     }

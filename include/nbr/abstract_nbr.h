@@ -68,6 +68,11 @@ namespace pipeann {
     virtual void insert(T *point, uint32_t loc) {
     }
 
+    // Release heavy in-memory data (e.g. compressed vectors) after build.
+    // The object stays valid; call load() to re-populate from disk.
+    virtual void clear() {
+    }
+
     uint64_t npoints = 0;
   };
 }  // namespace pipeann

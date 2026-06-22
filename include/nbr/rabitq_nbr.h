@@ -124,7 +124,7 @@ namespace pipeann {
         }
       }
       float c_1 = -static_cast<float>((1 << 1) - 1) / 2.F;
-      float sumq = std::accumulate(rotated_query_float.data(), rotated_query_float.data() + pad_dim, static_cast<T>(0));
+      float sumq = std::accumulate(rotated_query_float.data(), rotated_query_float.data() + pad_dim, 0.0f);
 
       float *meta = get_meta(query_buf->nbr_ctx_scratch);
       meta[M_DELTA] = delta_;
@@ -331,6 +331,16 @@ namespace pipeann {
     void insert(T *point, uint32_t loc) {
       LOG(ERROR) << "Update is not supported by RaBitQNeighbor.";
       exit(-1);
+    }
+
+    void clear() override {
+      data.clear();
+      data.shrink_to_fit();
+      if (rotated_pivots != nullptr) {
+        delete[] rotated_pivots;
+        rotated_pivots = nullptr;
+      }
+      this->npoints = 0;
     }
 
    private:

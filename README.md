@@ -16,7 +16,7 @@ A low-latency, billion-scale, and updatable graph-based vector store on SSD.
 | 🎯 **Speculative Filtering** | 3K QPS & 6ms latency for attribute-filtered ANNS on 100 million vectors |
 | 💾 **Memory Efficient** | >10x less memory than in-memory indexes (~40GB for 1B vectors) |
 | 🐍 **Easy-to-Use** | Both Python (`faiss`-like) and C++ interfaces supported |
-| 🔌 **Seamless Integration** | LangChain- and Qdrant-compatible APIs for easy integration |
+| 🔌 **Seamless Integration** | Milvus-compatible API (drop-in MilvusClient + gRPC server) |
 | 🗄️ **Multi-SSD Scaling** | Scales to 70K QPS & 2ms tail latency on 1B vectors (4 SSDs, SPDK backend) |
 
 ## 📊 Performance Comparison
@@ -31,6 +31,27 @@ PipeANN is suitable for both **large-scale** and **memory-constraint** scenarios
 | 10M (SIFT) | 128 | 550MB | <1ms | 10K | ✅ | ❌ 4GB mem | ❌ 3ms |
 
 > Recall@10 = 0.99, Samsung PM9A3 SSD, 32B PQ-compressed vectors (128B for Wiki).
+
+## 🔌 Already on Milvus? Switch in one line
+
+PipeANN speaks the **Milvus API**. Point your existing code at PipeANN and keep everything else the same — no rewrite, no new SDK.
+
+```python
+# In-process, drop-in for pymilvus.MilvusClient (URI is a directory):
+from pipeann import MilvusClient
+client = MilvusClient(uri="./pipeann-data")
+
+# Or talk to the PipeANN gRPC server with the stock pymilvus client:
+from pymilvus import MilvusClient
+client = MilvusClient(uri="http://localhost:19530")   # PipeANN server, same wire protocol
+
+client.create_collection("demo", dimension=128, metric_type="L2")
+client.insert("demo", [{"id": 1, "vector": [0.1] * 128, "color": "red"}])
+client.create_index("demo")   # builds the SSD graph; lazy/no-op for the in-process client
+client.search("demo", data=[[0.1] * 128], filter="color == 'red'", limit=5)
+```
+
+You get PipeANN's on-disk, larger-than-RAM index and speculative filtering behind the API you already use. See [Application Integrations](docs/application-integrations.md) for the full guide and Milvus-vs-PipeANN benchmarks.
 
 ---
 
@@ -48,6 +69,13 @@ Install dependencies:
 sudo apt install make cmake g++ libaio-dev libgoogle-perftools-dev \
                  clang-format libmkl-full-dev libeigen3-dev
 
+# gRPC, Protobuf, and RocksDB — required by the Milvus-compatible layer
+# (the gRPC server *and* the in-process MilvusClient, which share the same
+# RocksDB-backed collection engine). The Python module links RocksDB, so
+# these are needed even if you only use the Python interface.
+sudo apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
+                 protobuf-compiler librocksdb-dev
+
 # For Python interface
 pip install "pybind11[global]"
 
@@ -63,9 +91,28 @@ Build PipeANN:
 # For C++ users: build C++ binaries under build/
 bash ./build.sh
 
-# For Python users: build and install the Python interface
+# For Python users: build and install the Python interface.
+# This also builds and bundles the Milvus-compatible gRPC server binary,
+# so `pipeann-server` is available straight after install.
 pip install -e .
 ```
+
+#### Milvus-compatible gRPC server
+
+`pip install -e .` already builds and bundles the `pipeann_milvus_server`
+binary into the package (`pipeann/_bin/`), so you can launch it directly:
+
+```bash
+pipeann-server --data_dir ./data --port 19530 --threads 8
+```
+
+To build just the C++ server target on its own (without the Python interface):
+
+```bash
+cmake -B build -DBUILD_MILVUS_SERVER=ON . && cmake --build build --target pipeann_milvus_server
+```
+
+See [Application Integrations](docs/application-integrations.md) for running and connecting to the server.
 
 ### ⚡ C++
 
@@ -92,10 +139,11 @@ idx.save(index_prefix)                          # persist
 
 See [Python Interface](docs/python-interface.md#python-interface) for the full API, including filtered / OOD search and example output.
 
-See [Application Integrations](docs/application-integrations.md) for integration with LangChain, Qdrant, and Open WebUI.
+See [Application Integrations](docs/application-integrations.md) for the Milvus-compatible API (in-process and gRPC server).
 
 ## 📰 Updates
 
+- **May 26, 2026**: Filter config unified around SQL-like expressions with `$$var` placeholders for batch binding; legacy selector-config loader removed
 - **May 18, 2026**: SPDK backend supported, stable tail latency with better multi-SSD scalability
 - **May 18, 2026**: Filtered Search (Speculative Filtering), OOD search ([NGFix](https://dl.acm.org/doi/abs/10.1145/3769783)) & range search supported
 - **May 18, 2026**: PipeANN is integrated into OdinANN (search + insert), higher performance with less threads

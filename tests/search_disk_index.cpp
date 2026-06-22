@@ -3,7 +3,9 @@
 #include <ssd_index.h>
 #include <string.h>
 #include <time.h>
+#include <algorithm>
 #include <iomanip>
+#include <limits>
 
 #include "utils/log.h"
 #include "nbr/nbr.h"
@@ -46,9 +48,8 @@ int search_disk_index(int argc, char **argv) {
   bool calc_recall_flag = false;
 
   for (int ctr = index; ctr < argc; ctr++) {
-    uint64_t curL = std::atoi(argv[ctr]);
-    if (curL >= recall_at)
-      Lvec.push_back(curL);
+    uint64_t l_search = std::atoi(argv[ctr]);
+    Lvec.push_back(l_search);
   }
 
   if (Lvec.size() == 0) {
@@ -76,7 +77,7 @@ int search_disk_index(int argc, char **argv) {
   reader.reset(new LinuxAlignedFileReader());
   pipeann::AbstractNeighbor<T> *nbr_handler = pipeann::get_nbr_handler<T>(m, nbr_type);
   pipeann::IndexBuildParameters idx_params;
-  idx_params.max_nthreads = num_threads; // Restrict the number of buffers allocated. Unspecify this is also OK (default = 128).
+  idx_params.max_nthreads = std::max<uint32_t>(16, 2 * num_threads);
   std::unique_ptr<pipeann::SSDIndex<T>> _pFlashIndex(
       new pipeann::SSDIndex<T>(m, reader, nbr_handler, tags_flag, &idx_params));
 
@@ -187,9 +188,9 @@ int search_disk_index(int argc, char **argv) {
                                                    (uint32_t) recall_at);
       }
 
-      std::cout << std::setw(6) << L << std::setw(12) << beamwidth << std::setw(12) << qps << std::setw(12)
-                << mean_latency << std::setw(12) << latency_99 << std::setw(12) << mean_hops << std::setw(12)
-                << mean_ios;
+      std::cout << std::setw(10) << L
+                << std::setw(12) << beamwidth << std::setw(12) << qps << std::setw(12) << mean_latency << std::setw(12)
+                << latency_99 << std::setw(12) << mean_hops << std::setw(12) << mean_ios;
       if (calc_recall_flag) {
         std::cout << std::setw(12) << recall << std::endl;
       }
@@ -208,9 +209,9 @@ int search_disk_index(int argc, char **argv) {
   std::cout.precision(2);
 
   std::string recall_string = "Recall@" + std::to_string(recall_at);
-  std::cout << std::setw(6) << "L" << std::setw(12) << "I/O Width" << std::setw(12) << "QPS" << std::setw(12)
-            << "AvgLat(us)" << std::setw(12) << "P99 Lat" << std::setw(12) << "Mean Hops" << std::setw(12) << "Mean IOs"
-            << std::setw(12);
+  std::cout << std::setw(10) << "L" << std::setw(12) << "I/O Width" << std::setw(12)
+            << "QPS" << std::setw(12) << "AvgLat(us)" << std::setw(12) << "P99 Lat" << std::setw(12) << "Mean Hops"
+            << std::setw(12) << "Mean IOs" << std::setw(12);
   if (calc_recall_flag) {
     std::cout << std::setw(12) << recall_string << std::endl;
   } else
@@ -234,7 +235,7 @@ int main(int argc, char **argv) {
                  " <query_file.bin>  <truthset.bin (use \"null\" for none)> "
                  " <K> <similarity (cosine/l2/mips)> <nbr_type (pq/rabitq)>"
                  " <search_mode(0 for beam search / 1 for page search / 2 for pipe search)> <mem_L (0 means not "
-                 "using mem index)> <L1> [L2] etc."
+                 "using mem index)> <L_search1> [<L_search2> ...]"
               << std::endl;
     exit(-1);
   }

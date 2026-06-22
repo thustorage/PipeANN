@@ -7,9 +7,11 @@ data-example/*
 figures/*
 scripts/tests-pipeann/drop_cache
 pipeann/*.so
+pipeann/_bin/
 __pycache__/
 *.pyc
 pipeann/__pycache__/*
 pipeann.egg-info/
 dist/
 logs/**/*
+.claude/**/*

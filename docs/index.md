@@ -21,7 +21,7 @@ hide:
 | 🎯 **Speculative Filtering** | 3K QPS & 6ms latency for attribute-filtered ANNS on 100 million vectors |
 | 💾 **Memory Efficient** | >10x less memory than in-memory indexes (~40GB for 1B vectors) |
 | 🐍 **Easy-to-Use** | Both Python (`faiss`-like) and C++ interfaces supported |
-| 🔌 **Seamless Integration** | LangChain- and Qdrant-compatible APIs for easy integration |
+| 🔌 **Seamless Integration** | Milvus-compatible API (drop-in MilvusClient + gRPC server) |
 | 🗄️ **Multi-SSD Scaling** | Scales to 70K QPS & 2ms tail latency on 1B vectors (4 SSDs, SPDK backend) |
 
 ## 📊 Performance Comparison
@@ -87,6 +87,16 @@ pip install -e .
 bash ./build.sh
 ```
 
+For the optional **Milvus-compatible gRPC server**, install gRPC, Protobuf, and
+RocksDB, then build the server target:
+
+```bash
+sudo apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev \
+                 protobuf-compiler librocksdb-dev
+
+cd build_server && cmake -DBUILD_MILVUS_SERVER=ON .. && make -j pipeann_milvus_server
+```
+
 ### C++ Interface
 
 ```bash
@@ -114,9 +124,22 @@ See [Python Interface](python-interface.md) for the full API, including filtered
 
 ### Application Integrations
 
-PipeANN provides LangChain-compatible vector store and Qdrant-compatible HTTP API for seamless integration with existing applications (e.g., Open WebUI).
+PipeANN speaks the **Milvus API** — both an in-process `MilvusClient` and a
+high-performance C++ gRPC server — so existing Milvus applications can switch to
+PipeANN in one line:
 
-See [Application Integrations](application-integrations.md) for details.
+```python
+# In-process, drop-in for pymilvus.MilvusClient (URI is a directory):
+from pipeann import MilvusClient
+client = MilvusClient(uri="./pipeann-data")
+
+# Or connect the stock pymilvus client to the PipeANN gRPC server:
+from pymilvus import MilvusClient
+client = MilvusClient(uri="http://localhost:19530")
+```
+
+See [Application Integrations](application-integrations.md) for details and
+Milvus-vs-PipeANN benchmarks.
 
 ---
 

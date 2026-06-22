@@ -1,6 +1,7 @@
 #pragma once
 // Included by pipe_search.cpp and spec_filter_search.cpp which provide all necessary headers.
 
+#include <limits>
 #ifdef USE_URING
 #include "liburing.h"
 #endif
@@ -22,11 +23,11 @@ namespace pipeann {
   //
   template<typename T, typename TagT>
   template<typename SpecFn, typename VerifyFn>
-  void SSDIndex<T, TagT>::pipe_search_common(const T *query1, uint32_t mem_L, uint64_t l_search, uint64_t l_pool,
-                                             uint64_t beam_width, uint64_t read_io_size, bool use_dense_nbrs,
-                                             SpecFn is_member_approx, VerifyFn is_member,
+  void SSDIndex<T, TagT>::pipe_search_common(const T *query1, uint64_t k_search, uint32_t mem_L, uint64_t l_search,
+                                             uint64_t l_pool, uint64_t beam_width, bool read_pool_for_rerank,
+                                             bool use_dense_nbrs, SpecFn is_member_approx, VerifyFn is_member,
                                              std::vector<Neighbor> &full_retset, QueryStats *stats,
-                                             InsertContext *insert_ctx, float range_partial) {
+                                             InsertContext *insert_ctx, float range_partial, NodeOut *node_out) {
     QueryBuffer *query_buf = pop_query_buf(query1);
 #ifdef USE_URING
     void *ctx = reader->get_ctx(IORING_SETUP_SQPOLL);
@@ -38,6 +39,7 @@ namespace pipeann {
       LOG(ERROR) << "Beamwidth can not be higher than MAX_N_SECTOR_READS";
       crash();
     }
+    const uint64_t read_io_size = use_dense_nbrs ? io_size_dense : io_size;
 
     const T *query = query_buf->aligned_query<T>();
     query_buf->reset();
@@ -49,11 +51,20 @@ namespace pipeann {
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
     Timer query_timer;
+
     std::vector<Neighbor> retset(mem_L + this->params.R + l_pool * kExpandedNodesFactor);
     auto &visited = *(query_buf->visited);
     unsigned cur_list_size = 0;
 
     full_retset.reserve(l_pool * kExpandedNodesFactor);
+
+    // Smallest index with !retset[i].visited. This is cheap to maintain and
+    // lets calc_best_node and termination skip the already-settled prefix.
+    unsigned first_unvisited = 0;
+    // Smallest index that may still have retset[i].flag set. This avoids
+    // re-scanning sent/read candidates in send_best_read_req and is cheap to
+    // update on insertion.
+    unsigned send_marker = 0;
 
     // --- Exact distance computation + membership verification ---
     uint64_t coord_buf_idx = 0;
@@ -78,12 +89,24 @@ namespace pipeann {
         insert_ctx->coord_map.insert(std::make_pair(id, coord_ptr));
         coord_buf_idx++;
       }
+
+      // Milvus output_fields passthrough: stash this matched node's vector +
+      // filterable attrs keyed by tag, so the caller can serve output_fields
+      // without re-reading the page. Collected for every membership-passing node
+      // (more than top-k, but the map is small relative to l_pool and the caller
+      // only reads the top-k tags it returns).
+      if (node_out != nullptr) {
+        NodePayload payload;
+        payload.coords.assign(node.coords, node.coords + meta_.data_dim);
+        if (meta_.attr_size > 0) payload.attrs = Attributes::deserialize((char *) node.attrs);
+        node_out->insert(std::make_pair(id2tag(id), std::move(payload)));
+      }
       return true;
     };
 
     // --- Unified neighbor expansion (1-hop approx -> 2-hop approx -> 1-hop connectivity) ---
     uint64_t n_computes = 0;
-    auto compute_and_push_nbrs = [&](DiskNode<T> &node, unsigned &nk) {
+    auto compute_and_push_nbrs = [&](DiskNode<T> &node) {
       unsigned nbors_cand_size = 0;
       uint32_t *nbr_ids = query_buf->nbr_id_scratch;
 
@@ -137,8 +160,11 @@ namespace pipeann {
               retset.resize(2 * cur_list_size);
             }
           }
-          if (r < nk)
-            nk = r;
+
+          if (r < first_unvisited) {
+            first_unvisited = r;
+          }
+          send_marker = std::min(send_marker, r);
         }
       }
     };
@@ -180,6 +206,7 @@ namespace pipeann {
       unsigned page_id;
       unsigned loc;
       IORequest *read_req;
+      uint32_t retset_idx;  // index into retset for rerank-only reads (UINT32_MAX during graph search)
       bool operator>(const io_t &rhs) const {
         return nbr.distance > rhs.nbr.distance;
       }
@@ -204,7 +231,7 @@ namespace pipeann {
                       sector_scratch);
       reader->send_read(req, ctx);
 
-      on_flight_ios.push(io_t{item, pid, loc, &req});
+      on_flight_ios.push(io_t{item, pid, loc, &req, UINT32_MAX});
       cur_buf_idx = (cur_buf_idx + 1) % MAX_N_SECTOR_READS;
 
       if (stats != nullptr) {
@@ -235,25 +262,25 @@ namespace pipeann {
     };
 
     auto send_best_read_req = [&](uint32_t n) -> bool {
-      unsigned n_sent = 0, marker = 0;
-      while (marker < cur_list_size && n_sent < n) {
-        while (marker < cur_list_size &&
-               (retset[marker].flag == false || id_buf_map.find(retset[marker].id) != id_buf_map.end())) {
-          retset[marker].flag = false;
-          ++marker;
+      unsigned n_sent = 0;
+      while (send_marker < cur_list_size && n_sent < n) {
+        while (send_marker < cur_list_size &&
+               (retset[send_marker].flag == false || id_buf_map.find(retset[send_marker].id) != id_buf_map.end())) {
+          retset[send_marker].flag = false;
+          ++send_marker;
         }
-        if (marker >= cur_list_size) {
+        if (send_marker >= cur_list_size) {
           break;
         }
-        n_sent += send_read_req(retset[marker]);
+        n_sent += send_read_req(retset[send_marker]);
       }
       return n_sent != 0;
     };
 
     // --- Node selection ---
     auto calc_best_node = [&]() -> int {
-      unsigned marker = 0, nk = cur_list_size, first_unvisited_eager = cur_list_size;
-      for (marker = 0; marker < cur_list_size; ++marker) {
+      unsigned first_unvisited_eager = cur_list_size;
+      for (unsigned marker = first_unvisited; marker < cur_list_size; ++marker) {
         if (!retset[marker].visited && id_buf_map.find(retset[marker].id) != id_buf_map.end()) {
           retset[marker].flag = false;
           retset[marker].visited = true;
@@ -262,12 +289,18 @@ namespace pipeann {
           if (compute_exact_dists_and_push(node, id)) {
             retset[marker].is_member = true;
           }
-          compute_and_push_nbrs(node, nk);
+          compute_and_push_nbrs(node);
+          id_buf_map.erase(it);  // Keep id_buf_map limited to reads that still need exact-distance computation.
           break;
         }
       }
 
-      for (unsigned i = 0; i < cur_list_size; ++i) {
+      // Advance first_unvisited across the now-settled prefix.
+      while (first_unvisited < cur_list_size && retset[first_unvisited].visited) {
+        ++first_unvisited;
+      }
+
+      for (unsigned i = first_unvisited; i < cur_list_size; ++i) {
         if (!retset[i].visited && retset[i].flag && id_buf_map.find(retset[i].id) == id_buf_map.end()) {
           first_unvisited_eager = i;
           break;
@@ -284,21 +317,21 @@ namespace pipeann {
     constexpr float kRangeEarlyStopFactor = 2.0f;
     const float approx_range_partial = range_partial * kRangeEarlyStopFactor;
     auto terminate = [&]() -> bool {
-      int ret = -1;
+      if (first_unvisited >= cur_list_size)
+        return true;
+      // Same semantics as main, but bounded to the contiguous visited prefix
+      // [0, first_unvisited): count is_member, and break early if any
+      // retset[i].distance crosses approx_range_partial. Distance within the
+      // prefix is not monotone (sort key is (is_member_approx desc, distance
+      // asc), so distance can drop at the member/non-member boundary), so we
+      // must check each entry rather than just the last one.
       uint64_t is_member_cnt = 0;
-      bool range_crossed = false;
-      for (unsigned i = 0; i < cur_list_size; ++i) {
+      for (unsigned i = 0; i < first_unvisited; ++i) {
         is_member_cnt += retset[i].is_member;
-        if (!retset[i].visited) {
-          ret = i;
-          break;
-        }
-        if (retset[i].distance > approx_range_partial) {
-          range_crossed = true;
-          break;
-        }
+        if (retset[i].distance > approx_range_partial)
+          return true;
       }
-      return is_member_cnt >= l_search || ret == -1 || range_crossed;
+      return is_member_cnt >= l_search;
     };
 
     // --- Main search loop ---
@@ -313,6 +346,10 @@ namespace pipeann {
         retset[i].distance = dist_scratch[i];
       }
       std::sort(retset.begin(), retset.begin() + cur_list_size);
+      // Sort reorders positions: flag=true/visited entries can land before
+      // the old markers, so rescan from index 0.
+      first_unvisited = 0;
+      send_marker = 0;
     }
 
     int cur_n_in = 0, cur_tot = 0;
@@ -339,11 +376,43 @@ namespace pipeann {
       max_marker = std::max(max_marker, marker);
     }
 
-    // Drain remaining in-flight IOs.
-    while (!on_flight_ios.empty()) {
-      poll_all();
+    if (read_pool_for_rerank && l_pool > l_search) {
+      // Compute nodes that were read during graph search but not expanded before rerank starts.
+      for (auto &kv : id_buf_map) {
+        auto &[id, node] = kv;
+        compute_exact_dists_and_push(node, id);
+      }
+
+      // During rerank, reuse id_buf_map as the set of IDs whose exact distances are already computed.
+      // The DiskNode values may become stale after sector_scratch is reused; only the keys are used below.
+      const uint64_t rerank_beam_width = std::min(128ul, MAX_N_SECTOR_READS);
+      while (first_unvisited < cur_list_size || !on_flight_ios.empty()) {
+        reader->poll(ctx);
+        while (!on_flight_ios.empty() && on_flight_ios.front().finished()) {
+          io_t &io = on_flight_ios.front();
+          auto node = node_from_page((char *) io.read_req->buf, io.loc);
+          id_buf_map.insert(std::make_pair(io.nbr.id, node));  // Keep the key for first_unvisited advancement.
+          compute_exact_dists_and_push(node, io.nbr.id);       // Compute before this sector buffer is reused.
+          this->unlock_idx(idx_lock_table, io.nbr.id);
+          on_flight_ios.pop();
+        }
+
+        if (on_flight_ios.size() < rerank_beam_width) {
+          send_best_read_req(rerank_beam_width - on_flight_ios.size());
+        }
+
+        for (; first_unvisited < cur_list_size; ++first_unvisited) {
+          if (!retset[first_unvisited].visited && id_buf_map.find(retset[first_unvisited].id) == id_buf_map.end()) {
+            break;
+          }
+        }
+      }
+    } else {
+      // Drain remaining in-flight IOs.
+      while (!on_flight_ios.empty()) {
+        poll_all();
+      }
     }
-    calc_best_node();
 
     auto cpu2_ed = std::chrono::high_resolution_clock::now();
     if (stats != nullptr) {

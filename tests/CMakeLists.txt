@@ -1,3 +1,7 @@
+# All C++ test/tool executables in this directory get the tcmalloc allocator
+# (no-op when USE_TCMALLOC=OFF). Applies to every target defined below.
+link_libraries(pipeann_tcmalloc)
+
 add_executable(build_disk_index build_disk_index.cpp)
 target_link_libraries(build_disk_index ${PROJECT_NAME})
 
