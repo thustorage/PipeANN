@@ -33,6 +33,7 @@ jobs:
             protobuf-compiler \
             protobuf-compiler-grpc \
             librocksdb-dev \
+            libunwind-dev \
             libgoogle-perftools-dev
 
       - name: Build liburing
