@@ -1,8 +1,8 @@
 #pragma once
 
-#include <immintrin.h>
 #include <cmath>
 #include <cstdint>
+#include "utils/arch_compat.h"
 #include "utils.h"
 
 namespace pipeann {

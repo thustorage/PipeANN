@@ -8,7 +8,16 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-22.04
+    name: Ubuntu 22.04 (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: x64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out repository

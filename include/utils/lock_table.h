@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <omp.h>
 #include <shared_mutex>
+#include "utils/arch_compat.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "utils/log.h"
 
@@ -19,9 +20,7 @@ inline size_t portable_thread_id() {
 
 inline void thread_pause() {
   // Use pause instruction to reduce contention in tight loops.
-#ifdef __x86_64__
-  asm volatile("pause" ::: "memory");
-#endif
+  pipeann::cpu_pause();
 }
 
 namespace pipeann {

@@ -216,7 +216,7 @@ namespace pipeann {
 
       // pointers to buffers for data
       T *data_buf = coro_data.data_buf;
-      _mm_prefetch((char *) data_buf, _MM_HINT_T1);
+      pipeann::cpu_prefetch_t1((char *) data_buf);
 
       // query <-> PQ chunk centers distances
       nbr_handler->initialize_query(query, &coro_data.query_buf);

@@ -4,7 +4,6 @@
 #include "ssd_index_defs.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "distance.h"
-#include <immintrin.h>
 #include <vector>
 #include "utils/partition.h"
 #include "utils/kmeans_utils.h"

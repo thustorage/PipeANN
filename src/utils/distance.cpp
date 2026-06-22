@@ -1,6 +1,6 @@
-#include <immintrin.h>
 #include <cblas.h>
 #include <vector>
+#include "utils/arch_compat.h"
 #include "utils.h"
 #include "distance.h"
 

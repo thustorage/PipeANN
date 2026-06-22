@@ -1,7 +1,6 @@
 #pragma once
 
 #include "utils.h"
-#include <immintrin.h>
 #include <vector>
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "ssd_index_defs.h"

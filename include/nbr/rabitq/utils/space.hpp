@@ -1,7 +1,6 @@
 #pragma once
 
-#include <emmintrin.h>
-#include <immintrin.h>
+#include "utils/arch_compat.h"
 #include <omp.h>
 
 #include <cassert>
