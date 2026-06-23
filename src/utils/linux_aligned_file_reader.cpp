@@ -16,7 +16,6 @@
 #include <fstream>
 #include <thread>
 #include <unistd.h>
-#include <immintrin.h>
 #include <chrono>
 #include <pthread.h>
 #include "liburing.h"
@@ -427,7 +426,7 @@ void LinuxAlignedFileReader::send_io(IORequest &req, void *ctx, bool wr) {
 
     Poller::Cmd cmd{buf, ns_off >> lba_shift, (uint32_t) (chunk_size >> lba_shift), wr, &req};
     while (unlikely(!g_spdk.pollers[ns_id]->cmd_queue->push(cmd, tid))) {
-      _mm_pause();
+      pipeann::cpu_pause();
     }
 
     req.n_pending++;

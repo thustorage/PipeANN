@@ -65,7 +65,7 @@ PipeANN/
 │   ├── overall_perf_mem.cpp         # Insert-delete-search benchmark (in-memory)
 │   ├── pad_partition.cpp            # Pad partition file (for Starling)
 │   ├── normalize_data.cpp           # Normalize vectors (for cosine/MIPS)
-│   ├── test_cpu.cpp                 # CPU/SIMD sanity check
+│   ├── test_x86_avx.cpp             # x86 AVX feature sanity check
 │   ├── test_field_codec.cpp         # Scalar field codec unit test (server field_codec.h)
 │   └── utils/                    # Data utilities (vecs_to_bin, gt_update, ...)
 ├── proto/                        # gRPC protocol definitions

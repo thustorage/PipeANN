@@ -1,6 +1,6 @@
 #pragma once
 
-#include <immintrin.h>
+#include "utils/arch_compat.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,9 +9,9 @@
 // Scalable Gen 2 (Cascade Lake).  When not available, emulate it with a nibble
 // lookup table using AVX512BW instructions (_mm512_shuffle_epi8 + _mm512_sad_epu8),
 // both of which Cascade Lake does support.
-#ifdef USE_AVX512_VPOPCNTDQ
+#if PIPEANN_ARCH_X86 && defined(USE_AVX512_VPOPCNTDQ)
 #define MM512_POPCNT_EPI64(v) _mm512_popcnt_epi64(v)
-#else
+#elif PIPEANN_ARCH_X86
 inline __m512i _mm512_popcnt_epi64_compat(__m512i v) {
     // clang-format off
     const __m512i lookup = _mm512_set_epi8(
@@ -42,6 +42,20 @@ inline float warmup_ip_x0_q(
     size_t padded_dim,
     [[maybe_unused]] size_t _b_query = 0  // not used
 ) {
+#if !PIPEANN_ARCH_X86 || !defined(USE_AVX512)
+    const size_t num_blk = padded_dim / 64;
+    size_t ip_scalar = 0;
+    size_t ppc_scalar = 0;
+
+    for (size_t i = 0; i < num_blk; i++) {
+        const uint64_t x = data[i];
+        ppc_scalar += __builtin_popcountll(x);
+        for (uint32_t j = 0; j < b_query; j++) {
+            ip_scalar += __builtin_popcountll(x & query[i * b_query + j]) << j;
+        }
+    }
+    return (delta * static_cast<float>(ip_scalar)) + (vl * static_cast<float>(ppc_scalar));
+#else
     const size_t num_blk = padded_dim / 64;
     size_t ip_scalar = 0;
     size_t ppc_scalar = 0;
@@ -121,6 +135,7 @@ inline float warmup_ip_x0_q(
     }
 
     return (delta * static_cast<float>(ip_scalar)) + (vl * static_cast<float>(ppc_scalar));
+#endif
 }
 
 template <uint32_t b_query, uint32_t padded_dim>

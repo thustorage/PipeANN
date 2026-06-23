@@ -45,7 +45,7 @@ namespace pipeann {
     query_buf->reset();
 
     T *data_buf = query_buf->coord_scratch<T>();
-    _mm_prefetch((char *) data_buf, _MM_HINT_T1);
+    pipeann::cpu_prefetch_t1((char *) data_buf);
 
     char *sector_scratch = query_buf->sector_scratch;
     float *dist_scratch = query_buf->aligned_dist_scratch;

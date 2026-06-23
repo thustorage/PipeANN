@@ -2,7 +2,6 @@
 
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "utils.h"
-#include <immintrin.h>
 #include "nbr/pq_table.h"
 #include "ssd_index_defs.h"
 #include "nbr/abstract_nbr.h"
@@ -185,18 +184,18 @@ namespace pipeann {
     }
 
     inline void prefetch_chunk_dists(const float *ptr) {
-      _mm_prefetch((char *) ptr, _MM_HINT_NTA);
-      _mm_prefetch((char *) (ptr + 64), _MM_HINT_NTA);
-      _mm_prefetch((char *) (ptr + 128), _MM_HINT_NTA);
-      _mm_prefetch((char *) (ptr + 192), _MM_HINT_NTA);
+      pipeann::cpu_prefetch_nta((char *) ptr);
+      pipeann::cpu_prefetch_nta((char *) (ptr + 64));
+      pipeann::cpu_prefetch_nta((char *) (ptr + 128));
+      pipeann::cpu_prefetch_nta((char *) (ptr + 192));
     }
 
     inline void pq_dist_lookup(const uint8_t *pq_ids, const uint64_t n_pts, const uint64_t pq_nchunks,
                                const float *pq_dists, float *dists_out) {
-      _mm_prefetch((char *) dists_out, _MM_HINT_T0);
-      _mm_prefetch((char *) pq_ids, _MM_HINT_T0);
-      _mm_prefetch((char *) (pq_ids + 64), _MM_HINT_T0);
-      _mm_prefetch((char *) (pq_ids + 128), _MM_HINT_T0);
+      pipeann::cpu_prefetch_t0((char *) dists_out);
+      pipeann::cpu_prefetch_t0((char *) pq_ids);
+      pipeann::cpu_prefetch_t0((char *) (pq_ids + 64));
+      pipeann::cpu_prefetch_t0((char *) (pq_ids + 128));
 
       prefetch_chunk_dists(pq_dists);
       memset(dists_out, 0, n_pts * sizeof(float));

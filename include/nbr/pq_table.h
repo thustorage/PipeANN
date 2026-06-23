@@ -1,7 +1,7 @@
 #pragma once
 
+#include "utils/arch_compat.h"
 #include "utils.h"
-#include <immintrin.h>
 #include <cmath>
 
 #define NUM_PQ_CENTROIDS 256

@@ -1,5 +1,4 @@
 #pragma once
-#include <immintrin.h>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -13,6 +12,7 @@
 #include "ssd_index_defs.h"
 #include "filter/attribute.h"
 #include "filter/selector.h"
+#include "utils/arch_compat.h"
 #include "utils/concurrent_queue.h"
 #include "utils/lock_table.h"
 #include "utils/percentile_stats.h"

@@ -2,7 +2,6 @@
 
 #include "nbr/abstract_nbr.h"
 #include "utils.h"
-#include <immintrin.h>
 #include <sstream>
 #include <string_view>
 #include "utils/libcuckoo/cuckoohash_map.hh"

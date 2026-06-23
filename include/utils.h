@@ -17,9 +17,9 @@
 #include <malloc.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <immintrin.h>
 #include <omp.h>
 
+#include "utils/arch_compat.h"
 #include "utils/log.h"
 
 /*
@@ -289,7 +289,7 @@ namespace pipeann {
   inline void prefetch_vector(const char *vec, size_t vecsize) {
     size_t max_prefetch_size = (vecsize / 64) * 64;
     for (size_t d = 0; d < max_prefetch_size; d += 64)
-      _mm_prefetch((const char *) vec + d, _MM_HINT_T0);
+      pipeann::cpu_prefetch_t0((const char *) vec + d);
   }
 
   inline double calculate_recall(unsigned num_queries, unsigned *gold_std, float *gs_dist, unsigned dim_gs,
