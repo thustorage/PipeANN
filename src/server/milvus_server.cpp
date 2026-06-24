@@ -343,8 +343,28 @@ Status MilvusServiceImpl::GetLoadState(grpc::ServerContext *, const pb_milvus::G
 
 Status MilvusServiceImpl::Flush(grpc::ServerContext *, const pb_milvus::FlushRequest *req,
                                 pb_milvus::FlushResponse *resp) {
-  for (const auto &name : req->collection_names()) store_->flush(name);
+  for (const auto &name : req->collection_names()) {
+    store_->flush(name);
+    // Flush is synchronous; these fields only exist so pymilvus can poll
+    // GetFlushState without failing.
+    (*resp->mutable_coll_segids())[name];
+    (*resp->mutable_flush_coll_segids())[name];
+    (*resp->mutable_coll_flush_ts())[name] = 1;
+  }
   *resp->mutable_status() = ok_status();
+  return Status::OK;
+}
+
+Status MilvusServiceImpl::GetFlushState(grpc::ServerContext *, const pb_milvus::GetFlushStateRequest *req,
+                                        pb_milvus::GetFlushStateResponse *resp) {
+  if (!req->collection_name().empty() && !store_->has_collection(req->collection_name())) {
+    *resp->mutable_status() = err_status("collection not found");
+    return Status::OK;
+  }
+  *resp->mutable_status() = ok_status();
+  // Flush completes before the RPC returns, so any follow-up state check is
+  // immediately satisfied.
+  resp->set_flushed(true);
   return Status::OK;
 }
 

@@ -62,6 +62,8 @@ class MilvusServiceImpl final : public pb_milvus::MilvusService::Service {
                                   pb_milvus::GetLoadingProgressResponse *resp) override;
   grpc::Status Flush(grpc::ServerContext *ctx, const pb_milvus::FlushRequest *req,
                      pb_milvus::FlushResponse *resp) override;
+  grpc::Status GetFlushState(grpc::ServerContext *ctx, const pb_milvus::GetFlushStateRequest *req,
+                             pb_milvus::GetFlushStateResponse *resp) override;
 
   // Partitions. PipeANN has no partition concept (partition-scoped filtering is
   // handled through the attribute filter path), so these are compatibility
