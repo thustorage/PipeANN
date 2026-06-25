@@ -12,6 +12,7 @@
 #include <cblas.h>
 
 #include "utils/index_build_utils.h"
+#include "utils/tsl/robin_set.h"
 #include "filter/attribute.h"
 #include "utils/cached_io.h"
 #include "index.h"
@@ -144,10 +145,9 @@ namespace pipeann {
     std::mt19937 urng(rng());
 
     enum {ONE_HOP, OOD, DENSE, NHOOD_TYPE_CNT};
-    std::vector<bool> nhood_set[NHOOD_TYPE_CNT];
-    for (int i = 0; i < NHOOD_TYPE_CNT; i++) {
-      nhood_set[i].resize(nnodes, false);
-    }
+    // Per-node dedup sets keyed by global id; only hold the current node's neighbors
+    // (a few hundred entries), so they stay cache-resident even at billion scale.
+    tsl::robin_set<unsigned> nhood_set[NHOOD_TYPE_CNT];
     std::vector<unsigned> nhood[NHOOD_TYPE_CNT];
     
     std::vector<unsigned> final_nhood;
@@ -177,7 +177,7 @@ namespace pipeann {
       final_nhood.insert(final_nhood.end(), nhood[ONE_HOP].begin(), nhood[ONE_HOP].begin() + n_1hop);
       for (size_t i = 0; i < nhood[DENSE].size() && final_nhood.size() < R_dense; i++) {
         unsigned nbr = nhood[DENSE][i];
-        if (!nhood_set[ONE_HOP][nbr]) {
+        if (!nhood_set[ONE_HOP].count(nbr)) {
           final_nhood.push_back(nbr);
         }
       }
@@ -187,7 +187,7 @@ namespace pipeann {
       size_t n_ood_nbrs = 0;
       for (size_t i = 0; i < nhood[OOD].size() && n_ood_nbrs < R_ood && n_ood_nbrs < nnbrs; i++) {
         unsigned nbr = nhood[OOD][i];
-        if (nhood_set[ONE_HOP][nbr] || nhood_set[DENSE][nbr]) continue;
+        if (nhood_set[ONE_HOP].count(nbr) || nhood_set[DENSE].count(nbr)) continue;
         final_nhood[nnbrs - 1 - n_ood_nbrs] = nbr;  // reverse order into tail R_ood slots.
         n_ood_nbrs++;
       }
@@ -202,7 +202,7 @@ namespace pipeann {
       }
 
       for (size_t i = 0; i < NHOOD_TYPE_CNT; i++) {
-        nhood_set[i].assign(nnodes, false);
+        nhood_set[i].clear();
         nhood[i].clear();
       }
     };
@@ -231,13 +231,11 @@ namespace pipeann {
       for (uint16_t j = 0; j < shard_node.nnbrs; j++) {
         const unsigned renamed = idmaps[shard][shard_node.nbrs[j]];
         if (j < shard_node.nnbrs - shard_R_ood) { // base nbr.
-          if (!nhood_set[ONE_HOP][renamed]) {
-            nhood_set[ONE_HOP][renamed] = true;
+          if (nhood_set[ONE_HOP].insert(renamed).second) {
             nhood[ONE_HOP].push_back(renamed);
           }
         } else { // OOD nbr.
-          if (!nhood_set[OOD][renamed]) {
-            nhood_set[OOD][renamed] = true;
+          if (nhood_set[OOD].insert(renamed).second) {
             nhood[OOD].push_back(renamed);
           }
         }
@@ -245,8 +243,7 @@ namespace pipeann {
 
       for (uint16_t j = 0; j < shard_node.n_dense_nbrs; j++) { // dense nbr.
         const unsigned renamed = idmaps[shard][shard_node.dense_nbrs[j]];
-        if (!nhood_set[DENSE][renamed]) {
-          nhood_set[DENSE][renamed] = true;
+        if (nhood_set[DENSE].insert(renamed).second) {
           nhood[DENSE].push_back(renamed);
         }
       }
