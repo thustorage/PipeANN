@@ -20,7 +20,7 @@ namespace pipeann {
                                          QueryStats *stats, InsertContext *insert_ctx, NodeOut *node_out) {
     auto always_member = [](unsigned) -> bool { return true; };
     auto always_valid = [](unsigned, const DiskNode<T> &) -> bool { return true; };
-    this->pipe_search_common(query, k_search, mem_L, l_search, l_search, beam_width, false, false, always_member,
+    this->pipe_search_common(query, k_search, mem_L, l_search, l_search, beam_width, false, always_member,
                              always_valid, expanded_nodes_info, stats, insert_ctx,
                              std::numeric_limits<float>::infinity(), node_out);
   }
@@ -45,7 +45,7 @@ namespace pipeann {
 
     const float range_partial = get_partial_order_distance<T>(range, this->metric);
     std::vector<Neighbor> full_retset;
-    this->pipe_search_common(query, l_search, mem_L, l_search, l_search, beam_width, false, false, always_member,
+    this->pipe_search_common(query, l_search, mem_L, l_search, l_search, beam_width, false, always_member,
                              always_valid, full_retset, stats, nullptr, range_partial);
     return copy_top_k(full_retset, l_search, res_tags, res_dists, range_partial);
   }

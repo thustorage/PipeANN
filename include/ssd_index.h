@@ -165,8 +165,8 @@ namespace pipeann {
     // output_fields without a second disk read. nullptr (the default) => no
     // payload is collected and the search path is unchanged.
     struct NodePayload {
-      std::vector<T> coords;     // data_dim floats (the raw vector)
-      Attributes attrs;          // node's on-disk filterable scalar attributes
+      std::vector<T> coords;  // data_dim floats (the raw vector)
+      Attributes attrs;       // node's on-disk filterable scalar attributes
     };
     using NodeOut = tsl::robin_map<TagT, NodePayload>;
 
@@ -180,7 +180,6 @@ namespace pipeann {
     size_t pipe_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
                        TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr,
                        NodeOut *node_out = nullptr);
-
 
     // Range search: return every tag whose distance to query is <= range (in user-facing metric).
     // Early stop when all vectors with PQ_distance > kRangeEarlyStopFactor * range are explored, may miss some results.
@@ -317,7 +316,8 @@ namespace pipeann {
 
     // Mirror a single id->tag mapping into tag2id_ (no-op unless enabled).
     inline void track_tag2id(uint32_t id, const TagT &tag) {
-      if (enable_tag2id) tag2id_.insert_or_assign(tag, id);
+      if (enable_tag2id)
+        tag2id_.insert_or_assign(tag, id);
     }
 
     // Flags.
@@ -365,17 +365,15 @@ namespace pipeann {
 
     template<typename SpecFn, typename VerifyFn>
     void pipe_search_common(const T *query, uint64_t k_search, uint32_t mem_L, uint64_t l_search, uint64_t l_pool,
-                            uint64_t beam_width, bool read_pool_for_rerank, bool use_dense_nbrs,
-                            SpecFn is_member_approx, VerifyFn is_member, std::vector<Neighbor> &full_retset,
-                            QueryStats *stats = nullptr, InsertContext *insert_ctx = nullptr,
-                            float range_partial = std::numeric_limits<float>::infinity(),
-                            NodeOut *node_out = nullptr);
+                            uint64_t beam_width, bool use_dense_nbrs, SpecFn is_member_approx, VerifyFn is_member,
+                            std::vector<Neighbor> &full_retset, QueryStats *stats = nullptr,
+                            InsertContext *insert_ctx = nullptr,
+                            float range_partial = std::numeric_limits<float>::infinity(), NodeOut *node_out = nullptr);
 
     // Background I/O thread function.
     void bg_io_thread();
 
     int get_vector_by_id(const uint32_t &id, T *vector);
-
 
     // Deduplicate sorted results and copy top-k to output arrays.
     size_t copy_top_k(const std::vector<Neighbor> &sorted_results, uint64_t k, TagT *res_tags, float *res_dists,

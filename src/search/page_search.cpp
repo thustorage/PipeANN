@@ -1,6 +1,7 @@
 #include "aligned_file_reader.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "ssd_index.h"
+#include "candidate_pool.h"
 #include <malloc.h>
 #include <algorithm>
 
@@ -50,10 +51,9 @@ namespace pipeann {
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
     Timer query_timer, io_timer, cpu_timer;
-    std::vector<Neighbor> retset(4096);
+    CandidatePool pool(l_search, l_search + 1);
     tsl::robin_set<uint64_t> &visited = *(query_buf->visited);
     tsl::robin_set<unsigned> &page_visited = *(query_buf->page_visited);
-    unsigned cur_list_size = 0;
 
     std::vector<Neighbor> full_retset;
     full_retset.reserve(4096);
@@ -62,11 +62,11 @@ namespace pipeann {
       T *node_fp_coords_copy = data_buf;
       memcpy(node_fp_coords_copy, node.coords, meta_.data_dim * sizeof(T));
       float cur_expanded_dist = dist_cmp->compare(query, node_fp_coords_copy, (unsigned) aligned_dim);
-      full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
+      full_retset.push_back(Neighbor(id, cur_expanded_dist));
       return cur_expanded_dist;
     };
 
-    auto compute_and_push_nbrs = [&](DiskNode<T> &node, unsigned &nk) {
+    auto compute_and_push_nbrs = [&](DiskNode<T> &node) {
       unsigned *node_nbrs = node.nbrs;
       unsigned nnbrs = node.nnbrs;
       unsigned nbors_cand_size = 0;
@@ -84,17 +84,7 @@ namespace pipeann {
           if (stats != nullptr) {
             stats->n_cmps++;
           }
-          if (nbor_dist >= retset[cur_list_size - 1].distance && (cur_list_size == l_search))
-            continue;
-          Neighbor nn(nbor_id, nbor_dist, true);
-          // Return position in sorted list where nn inserted
-          auto r = InsertIntoPool(retset.data(), cur_list_size, nn);  // may be overflow in retset...
-          if (cur_list_size < l_search)
-            ++cur_list_size;
-          // nk logs the best position in the retset that was updated due to
-          // neighbors of n.
-          if (r < nk)
-            nk = r;
+          pool.insert(Neighbor(nbor_id, nbor_dist));
         }
       }
     };
@@ -102,9 +92,7 @@ namespace pipeann {
     auto compute_and_add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids) {
       nbr_handler->compute_dists(query_buf, node_ids, n_ids);
       for (uint64_t i = 0; i < n_ids; ++i) {
-        retset[cur_list_size].id = node_ids[i];
-        retset[cur_list_size].distance = query_buf->aligned_dist_scratch[i];
-        retset[cur_list_size++].flag = true;
+        pool.insert(Neighbor(node_ids[i], query_buf->aligned_dist_scratch[i]));
         visited.insert(node_ids[i]);
       }
     };
@@ -122,10 +110,7 @@ namespace pipeann {
       compute_and_add_to_retset(&meta_.entry_point_id, 1);
     }
 
-    std::sort(retset.begin(), retset.begin() + cur_list_size);
-
     unsigned num_ios = 0;
-    unsigned k = 0;
 
     // cleared every iteration
     std::vector<unsigned> frontier;
@@ -143,29 +128,29 @@ namespace pipeann {
     std::vector<char> last_pages(SECTOR_LEN * beam_width * 2);
 
     // search on disk.
-    while (k < cur_list_size) {
-      unsigned nk = cur_list_size;
+    while (!pool.all_visited()) {
       // clear iteration state
       frontier.clear();
       frontier_nhoods.clear();
       frontier_read_reqs.clear();
       sector_scratch_idx = 0;
-      // find new beam
-      uint32_t marker = k;
-      uint32_t num_seen = 0;
 
-      // distribute cache and disk-read nodes
-      // 100 us
-      while (marker < cur_list_size && frontier.size() < beam_width && num_seen < beam_width) {
-        const unsigned pid = id2page(retset[marker].id);
-        if (page_visited.find(pid) == page_visited.end() && retset[marker].flag) {
-          num_seen++;
-          // disable nhood cache.
-          frontier.push_back(retset[marker].id);
-          page_visited.insert(pid);
-          retset[marker].flag = false;
+      // Pick the beam: pull the closest unvisited nodes (next_unvisited marks each
+      // visited and advances the frontier), fetching each distinct page at most
+      // once. Co-located nodes on an already-picked page are still marked visited
+      // here and computed via the last_io_snapshot path; termination is plain
+      // all_visited().
+      for (uint32_t num_seen = 0; num_seen < beam_width;) {
+        Neighbor *node = pool.next_unvisited();
+        if (node == nullptr) {
+          break;
         }
-        marker++;
+        const unsigned pid = id2page(node->id);
+        if (page_visited.find(pid) == page_visited.end()) {
+          page_visited.insert(pid);
+          frontier.push_back(node->id);
+          ++num_seen;
+        }
       }
 
       // read nhoods of frontier ids
@@ -217,7 +202,7 @@ namespace pipeann {
 
         // compute PQ distances for neighbours of the vectors in the page
         for (unsigned k = 0; k < vis_cand.size(); ++k) {
-          compute_and_push_nbrs(vis_cand[k].second, nk);
+          compute_and_push_nbrs(vis_cand[k].second);
         }
       }
       last_io_snapshot.clear();
@@ -249,18 +234,12 @@ namespace pipeann {
           if (cur_id == id) {
             DiskNode<T> node = node_from_page(sector_buf, j);
             compute_exact_dists_and_push(node, id);
-            compute_and_push_nbrs(node, nk);
+            compute_and_push_nbrs(node);
           }
         }
       }
       auto cpu_ed = std::chrono::high_resolution_clock::now();
       stats->cpu_us += std::chrono::duration_cast<std::chrono::microseconds>(cpu_ed - cpu_st).count();
-
-      // update best inserted position
-      if (nk <= k)
-        k = nk;  // k is the best position in retset updated in this round.
-      else
-        ++k;
     }
 
     std::sort(full_retset.begin(), full_retset.end(),

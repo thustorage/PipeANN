@@ -1,6 +1,7 @@
 #include "aligned_file_reader.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "ssd_index.h"
+#include "candidate_pool.h"
 #include <malloc.h>
 #include <algorithm>
 
@@ -42,14 +43,13 @@ namespace pipeann {
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
     Timer query_timer, io_timer, cpu_timer;
-    std::vector<Neighbor> retset(mem_L + kExpandedNodesFactor * l_search);
+    CandidatePool pool(l_search, mem_L + kExpandedNodesFactor * l_search);
     tsl::robin_set<uint64_t> visited(4096);
     std::vector<Neighbor> &full_retset = expanded_nodes_info;
     full_retset.clear();
     full_retset.reserve(kExpandedNodesFactor * l_search);
     uint64_t coord_buf_idx = 0;
 
-    unsigned cur_list_size = 0;
     auto compute_exact_dist_and_push = [&](const DiskNode<T> &node, const unsigned id) -> float {
       memcpy(data_buf, node.coords, meta_.data_dim * sizeof(T));
       float cur_expanded_dist = dist_cmp->compare(query, data_buf, (unsigned) aligned_dim);
@@ -63,16 +63,17 @@ namespace pipeann {
         insert_ctx->coord_map.insert(std::make_pair(id, coord_ptr));
         coord_buf_idx++;
       }
-      full_retset.push_back(Neighbor(id, cur_expanded_dist, true));
+      full_retset.push_back(Neighbor(id, cur_expanded_dist));
       return cur_expanded_dist;
     };
 
     auto compute_and_add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids) {
       nbr_handler->compute_dists(query_buf, node_ids, n_ids);
       for (uint64_t i = 0; i < n_ids; ++i) {
-        retset[cur_list_size].id = node_ids[i];
-        retset[cur_list_size].distance = dist_scratch[i];
-        retset[cur_list_size++].flag = true;
+        // Unfiltered search: seeds and expansion nodes share is_member_approx so
+        // the pool stays monotone in distance (is_member_approx is the primary
+        // sort key and is meaningful only for in-filter search).
+        pool.insert(Neighbor(node_ids[i], dist_scratch[i]));
         visited.insert(node_ids[i]);
       }
     };
@@ -86,9 +87,6 @@ namespace pipeann {
       compute_and_add_to_retset(&meta_.entry_point_id, 1);
     }
 
-    std::sort(retset.begin(), retset.begin() + cur_list_size);
-
-    unsigned k = 0;
     std::vector<unsigned> frontier;
     using fnhood_t = std::tuple<unsigned, unsigned, char *>;
     std::vector<fnhood_t> frontier_nhoods;
@@ -96,22 +94,18 @@ namespace pipeann {
     std::vector<uint64_t> page_ref;
     auto *page_ref_out = insert_ctx != nullptr ? &insert_ctx->page_ref : &page_ref;
 
-    while (k < cur_list_size) {
-      auto nk = cur_list_size;
+    while (!pool.all_visited()) {
       frontier.clear();
       frontier_nhoods.clear();
       frontier_read_reqs.clear();
       sector_scratch_idx = 0;
 
-      uint32_t marker = k;
-      uint32_t num_seen = 0;
-      while (marker < cur_list_size && frontier.size() < beam_width && num_seen < beam_width) {
-        if (retset[marker].flag) {
-          num_seen++;
-          frontier.push_back(retset[marker].id);
-          retset[marker].flag = false;
+      for (uint32_t num_seen = 0; num_seen < beam_width; ++num_seen) {
+        Neighbor *node = pool.next_unvisited();
+        if (node == nullptr) {
+          break;
         }
-        marker++;
+        frontier.push_back(node->id);
       }
 
       if (!frontier.empty()) {
@@ -169,31 +163,12 @@ namespace pipeann {
           if (stats != nullptr) {
             stats->n_cmps++;
           }
-          if (dist >= retset[cur_list_size - 1].distance && (cur_list_size == l_search)) {
-            continue;
-          }
-          Neighbor nn(id, dist, true);
-          auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
-          if (cur_list_size < l_search) {
-            ++cur_list_size;
-            if (unlikely(cur_list_size >= retset.size())) {
-              retset.resize(2 * cur_list_size);
-            }
-          }
-          if (r < nk) {
-            nk = r;
-          }
+          pool.insert(Neighbor(id, dist));
         }
 
         if (stats != nullptr) {
           stats->cpu_us += (double) cpu_timer.elapsed();
         }
-      }
-
-      if (nk <= k) {
-        k = nk;
-      } else {
-        ++k;
       }
 
       if (stats != nullptr && stats->n_current_used != 0) {

@@ -27,6 +27,7 @@
 #include "index.h"
 #include "utils/timer.h"
 #include "utils.h"
+#include "candidate_pool.h"
 #include "utils/lock_table.h"
 #include "utils/prune_neighbors.h"
 
@@ -137,101 +138,75 @@ namespace pipeann {
                                                                        tsl::robin_set<unsigned> &expanded_nodes_ids,
                                                                        std::vector<Neighbor> &best_L_nodes,
                                                                        QueryStats *stats) {
-    best_L_nodes.resize(Lsize + 1);
-    for (unsigned i = 0; i < Lsize + 1; i++) {
-      best_L_nodes[i].distance = std::numeric_limits<float>::max();
-    }
     expanded_nodes_info.reserve(10 * Lsize);
     expanded_nodes_ids.reserve(10 * Lsize);
 
-    unsigned l = 0;
-    Neighbor nn;
     tsl::robin_set<unsigned> inserted_into_pool;
     inserted_into_pool.reserve(Lsize * 20);
 
+    CandidatePool pool(Lsize, Lsize + 1);
     for (auto id : init_ids) {
       assert(id < max_points());
-      nn = Neighbor(id, _distance->compare(_data.data() + _dim * (size_t) id, node_coords, _dim), true);
       if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
         inserted_into_pool.insert(id);
-        best_L_nodes[l++] = nn;
+        pool.insert(Neighbor(id, _distance->compare(_data.data() + _dim * (size_t) id, node_coords, _dim)));
       }
-      if (l == Lsize)
-        break;
     }
 
     Timer query_timer, io_timer, cpu_timer;
-
-    /* sort best_L_nodes based on distance of each point to node_coords */
-    std::sort(best_L_nodes.begin(), best_L_nodes.begin() + l);
-    unsigned k = 0;
     uint32_t hops = 0;
     uint32_t cmps = 0;
 
-    while (k < l) {
-      unsigned nk = l;
+    Neighbor *cur;
+    while ((cur = pool.next_unvisited()) != nullptr) {
+      ++hops;
+      io_timer.reset();
+      auto n = cur->id;
+      expanded_nodes_info.emplace_back(*cur);
+      expanded_nodes_ids.insert(n);
+      std::vector<unsigned> des;
 
-      if (best_L_nodes[k].flag) {
-        ++hops;
-        io_timer.reset();
-        best_L_nodes[k].flag = false;
-        auto n = best_L_nodes[k].id;
-        expanded_nodes_info.emplace_back(best_L_nodes[k]);
-        expanded_nodes_ids.insert(n);
-        std::vector<unsigned> des;
-
-        {
-          // pipeann::SparseReadLockGuard<uint64_t> guard(&_locks, n);
-          pipeann::LockGuard guard(_locks->rdlock(n));
-          for (unsigned m = 0; m < _final_graph[n].size(); m++) {
-            if (_final_graph[n][m] >= max_points()) {
-              LOG(ERROR) << "Wrong id found: " << _final_graph[n][m];
-              crash();
-            }
-            des.emplace_back(_final_graph[n][m]);
+      {
+        // pipeann::SparseReadLockGuard<uint64_t> guard(&_locks, n);
+        pipeann::LockGuard guard(_locks->rdlock(n));
+        for (unsigned m = 0; m < _final_graph[n].size(); m++) {
+          if (_final_graph[n][m] >= max_points()) {
+            LOG(ERROR) << "Wrong id found: " << _final_graph[n][m];
+            crash();
           }
+          des.emplace_back(_final_graph[n][m]);
         }
-        if (stats != nullptr) {
-          stats->io_us += io_timer.elapsed();  // read vec
-        }
+      }
+      if (stats != nullptr) {
+        stats->io_us += io_timer.elapsed();  // read vec
+      }
 
-        cpu_timer.reset();
+      cpu_timer.reset();
 
-        for (unsigned m = 0; m < des.size(); ++m) {
-          unsigned id = des[m];
-          if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
-            inserted_into_pool.insert(id);
+      for (unsigned m = 0; m < des.size(); ++m) {
+        unsigned id = des[m];
+        if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
+          inserted_into_pool.insert(id);
 
-            // io_timer.reset();
-            if ((m + 1) < des.size()) {
-              auto nextn = des[m + 1];
-              pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
-            }
-            cmps++;
-
-            float dist = _distance->compare(node_coords, _data.data() + _dim * (size_t) id, (unsigned) _dim);
-
-            if (dist >= best_L_nodes[l - 1].distance && (l == Lsize))
-              continue;
-
-            Neighbor nn(id, dist, true);
-            unsigned r = InsertIntoPool(best_L_nodes.data(), l, nn);
-            if (l < Lsize)
-              ++l;
-            if (r < nk)
-              nk = r;
+          if ((m + 1) < des.size()) {
+            auto nextn = des[m + 1];
+            pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
           }
-        }
-        if (stats != nullptr) {
-          stats->cpu_us += cpu_timer.elapsed();  // compute + read nbr
-        }
+          cmps++;
 
-        if (nk <= k)
-          k = nk;
-        else
-          ++k;
-      } else
-        k++;
+          float dist = _distance->compare(node_coords, _data.data() + _dim * (size_t) id, (unsigned) _dim);
+
+          pool.insert(Neighbor(id, dist));
+        }
+      }
+      if (stats != nullptr) {
+        stats->cpu_us += cpu_timer.elapsed();  // compute + read nbr
+      }
+    }
+
+    best_L_nodes.resize(Lsize + 1);
+    for (unsigned i = 0; i < Lsize + 1; ++i) {
+      best_L_nodes[i] = pool[i];
     }
     return std::make_pair(hops, cmps);
   }
@@ -288,7 +263,7 @@ namespace pipeann {
           if (cur_nbr != des) {
             float dist =
                 _distance->compare(_data.data() + _dim * (size_t) des, _data.data() + _dim * (size_t) cur_nbr, _dim);
-            pool.emplace_back(Neighbor(cur_nbr, dist, true));
+            pool.emplace_back(Neighbor(cur_nbr, dist));
           }
         }
         std::vector<unsigned> new_out_neighbors;
@@ -372,7 +347,7 @@ namespace pipeann {
           if (cur_nbr != node) {
             float dist =
                 _distance->compare(_data.data() + _dim * (size_t) node, _data.data() + _dim * (size_t) cur_nbr, _dim);
-            pool.emplace_back(Neighbor(cur_nbr, dist, true));
+            pool.emplace_back(Neighbor(cur_nbr, dist));
           }
         }
         pipeann::prune_neighbors(pool, new_out_neighbors, params, _dist_metric, [this](uint32_t a, uint32_t b) {
@@ -532,8 +507,7 @@ namespace pipeann {
     if (cand_ids != nullptr) {
       best_L_nodes.reserve(cand_ids->size());
       for (auto loc : *cand_ids) {
-        best_L_nodes.emplace_back(loc, _distance->compare(aligned_query, _data.data() + (size_t) loc * _dim, _dim),
-                                  true);
+        best_L_nodes.emplace_back(loc, _distance->compare(aligned_query, _data.data() + (size_t) loc * _dim, _dim));
       }
       std::sort(best_L_nodes.begin(), best_L_nodes.end());
       retval.second = (uint32_t) best_L_nodes.size();
@@ -596,67 +570,42 @@ namespace pipeann {
   template<typename T, typename TagT>
   uint32_t Index<T, TagT>::search_with_tags_fast(const T *normalized_query, const unsigned Lsize, TagT *tags,
                                                  float *dists) {
-    std::vector<Neighbor> best_L_nodes(Lsize + 1);
-    for (unsigned i = 0; i < Lsize + 1; i++) {
-      best_L_nodes[i].distance = std::numeric_limits<float>::max();
-    }
+    CandidatePool pool(Lsize, Lsize + 1);
 
-    unsigned l = 0;
-    Neighbor nn;
     tsl::robin_set<unsigned> inserted_into_pool;
     inserted_into_pool.reserve(Lsize * 20);
 
-    auto id = _ep;
-    nn = Neighbor(id, _distance->compare(_data.data() + _dim * (size_t) id, normalized_query, _dim), true);
-    inserted_into_pool.insert(id);
-    best_L_nodes[l++] = nn;
+    auto ep = _ep;
+    inserted_into_pool.insert(ep);
+    pool.insert(Neighbor(ep, _distance->compare(_data.data() + _dim * (size_t) ep, normalized_query, _dim)));
 
-    unsigned k = 0, cmps = 0;
+    unsigned cmps = 0;
 
-    while (k < l) {
-      unsigned nk = l;
+    Neighbor *cur;
+    while ((cur = pool.next_unvisited()) != nullptr) {
+      auto n = cur->id;
 
-      if (best_L_nodes[k].flag) {
-        best_L_nodes[k].flag = false;
-        auto n = best_L_nodes[k].id;
+      auto &cur_v = _final_graph[n];
+      for (unsigned m = 0; m < cur_v.size(); ++m) {
+        unsigned id = cur_v[m];
+        if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
+          inserted_into_pool.insert(id);
 
-        auto &cur_v = _final_graph[n];
-        for (unsigned m = 0; m < cur_v.size(); ++m) {
-          unsigned id = cur_v[m];
-          if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
-            inserted_into_pool.insert(id);
-
-            if ((m + 1) < cur_v.size()) {
-              auto nextn = cur_v[m + 1];
-              pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
-            }
-
-            float dist = _distance->compare(normalized_query, _data.data() + _dim * (size_t) id, (unsigned) _dim);
-            cmps++;
-
-            if (dist >= best_L_nodes[l - 1].distance && (l == Lsize))
-              continue;
-
-            Neighbor nn(id, dist, true);
-            unsigned r = InsertIntoPool(best_L_nodes.data(), l, nn);
-            if (l < Lsize)
-              ++l;
-            if (r < nk)
-              nk = r;
+          if ((m + 1) < cur_v.size()) {
+            auto nextn = cur_v[m + 1];
+            pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
           }
-        }
 
-        if (nk <= k)
-          k = nk;
-        else
-          ++k;
-      } else {
-        k++;
+          float dist = _distance->compare(normalized_query, _data.data() + _dim * (size_t) id, (unsigned) _dim);
+          cmps++;
+
+          pool.insert(Neighbor(id, dist));
+        }
       }
     }
     for (uint32_t i = 0; i < Lsize; ++i) {
-      tags[i] = _location_to_tag[best_L_nodes[i].id];
-      dists[i] = best_L_nodes[i].distance;
+      tags[i] = _location_to_tag[pool[i].id];
+      dists[i] = pool[i].distance;
     }
     return cmps;
   }
@@ -726,7 +675,7 @@ namespace pipeann {
         pool.reserve(new_nbrs.size());
         for (auto nbr : new_nbrs) {
           float dist = _distance->compare(_data.data() + _dim * old_id, _data.data() + _dim * nbr, _dim);
-          pool.emplace_back(nbr, dist, true);
+          pool.emplace_back(nbr, dist);
         }
         pipeann::prune_neighbors(pool, new_nbrs, params, _dist_metric, [this](uint32_t a, uint32_t b) {
           return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
@@ -1134,7 +1083,7 @@ namespace pipeann {
     pool.reserve(res.size());
     for (unsigned v : res) {
       float d = _distance->compare(_data.data() + _dim * (size_t) ANN, _data.data() + _dim * (size_t) v, _dim);
-      pool.emplace_back(Neighbor(v, d, true));
+      pool.emplace_back(Neighbor(v, d));
     }
 
     IndexBuildParameters rfix_params;

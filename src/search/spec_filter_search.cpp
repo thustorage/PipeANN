@@ -168,7 +168,7 @@ namespace pipeann {
           pq.pop();
         }
         if (pq.size() < l_search) {
-          pq.push(Neighbor(vector_ids[i + j], query_buf->aligned_dist_scratch[j], true));
+          pq.push(Neighbor(vector_ids[i + j], query_buf->aligned_dist_scratch[j]));
         }
       }
     }
@@ -272,7 +272,7 @@ namespace pipeann {
     };
 
     std::vector<Neighbor> full_retset;
-    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, false, false, always_member, verify, full_retset,
+    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, false, always_member, verify, full_retset,
                              stats, nullptr, std::numeric_limits<float>::infinity(), node_out);
 
     return copy_top_k(full_retset, k_search, res_tags, res_dists);
@@ -303,7 +303,7 @@ namespace pipeann {
     };
 
     std::vector<Neighbor> full_retset;
-    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, false, true, is_member_approx, verify, full_retset,
+    this->pipe_search_common(query1, l_search, 0, l_search, l_max, beam_width, true, is_member_approx, verify, full_retset,
                              stats, nullptr, std::numeric_limits<float>::infinity(), node_out);
 
     return copy_top_k(full_retset, k_search, res_tags, res_dists);

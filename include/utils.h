@@ -115,6 +115,18 @@ namespace pipeann {
   enum Metric { L2 = 0, INNER_PRODUCT = 1, COSINE = 2 };
   enum FilterType : int { PRE_FILTER = 0, IN_FILTER = 1, POST_FILTER = 2, N_FILTER_TYPES = 3 };
 
+  // Predicate that accepts everything, whatever the argument list. Serves as the
+  // default readiness predicate for synchronous CandidatePool callers (they
+  // never consult it, so the return value is a don't-care) and, in the search
+  // entry points, as the no-op membership/verification predicate for unfiltered
+  // search. Variadic so one type covers both the (id) and (id, node) call shapes.
+  struct AlwaysTrue {
+    template<class... Args>
+    constexpr bool operator()(const Args &...) const noexcept {
+      return true;
+    }
+  };
+
   inline void alloc_aligned(void **ptr, size_t size, size_t align) {
     std::ignore = posix_memalign(ptr, align, size);
     // *ptr = nullptr;
@@ -394,69 +406,25 @@ namespace pipeann {
     float distance;
     bool flag;
     bool visited;
-    bool is_member_approx;  // used by in-filter, prioritize them in the retset.
-    bool is_member;         // Accurate, to check if early stop.
+    bool is_member;  // Accurate, to check if early stop.
 
     Neighbor() = default;
-    Neighbor(unsigned id, float distance, bool f, bool is_member_approx = true)
-        : id{id}, distance{distance}, flag(f), visited(false), is_member_approx(is_member_approx), is_member(false) {
+    Neighbor(unsigned id, float distance) : id{id}, distance{distance}, flag(true), visited(false), is_member(false) {
     }
 
     inline bool operator<(const Neighbor &other) const {
-      // is_member goes first.
-      return (is_member_approx > other.is_member_approx) ||
-             (is_member_approx == other.is_member_approx && distance < other.distance) ||
-             (is_member_approx == other.is_member_approx && distance == other.distance && id < other.id);
+      return (distance < other.distance) || (distance == other.distance && id < other.id);
     }
     inline bool operator==(const Neighbor &other) const {
       return (id == other.id);
     }
     inline bool operator>(const Neighbor &other) const {
-      return (is_member_approx < other.is_member_approx) ||
-             (is_member_approx == other.is_member_approx && distance > other.distance) ||
-             (is_member_approx == other.is_member_approx && distance == other.distance && id > other.id);
+      return (distance > other.distance) || (distance == other.distance && id > other.id);
     }
     inline bool operator>=(const Neighbor &other) const {
-      return (is_member_approx < other.is_member_approx) ||
-             (is_member_approx == other.is_member_approx && distance >= other.distance) ||
-             (is_member_approx == other.is_member_approx && distance == other.distance && id >= other.id);
+      return (distance > other.distance) || (distance == other.distance && id >= other.id);
     }
   };
-
-  static inline unsigned InsertIntoPool(Neighbor *addr, unsigned K, Neighbor nn) {
-    // find the location to insert
-    unsigned left = 0, right = K - 1;
-    if (addr[left] > nn) {
-      memmove((char *) &addr[left + 1], &addr[left], K * sizeof(Neighbor));
-      addr[left] = nn;
-      return left;
-    }
-    if (addr[right] < nn) {
-      addr[K] = nn;
-      return K;
-    }
-    while (right > 1 && left < right - 1) {
-      unsigned mid = (left + right) / 2;
-      if (addr[mid] > nn)
-        right = mid;
-      else
-        left = mid;
-    }
-    // check equal ID
-
-    while (left > 0) {
-      if (addr[left] < nn)
-        break;
-      if (addr[left].id == nn.id)
-        return K + 1;
-      left--;
-    }
-    if (addr[left].id == nn.id || addr[right].id == nn.id)
-      return K + 1;
-    memmove((char *) &addr[right + 1], &addr[right], (K - right) * sizeof(Neighbor));
-    addr[right] = nn;
-    return right;
-  }
 
   /*
    * For float, we normalize to 1.

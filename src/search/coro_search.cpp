@@ -1,6 +1,7 @@
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "ssd_index_defs.h"
 #include "ssd_index.h"
+#include "candidate_pool.h"
 #include <malloc.h>
 #include <algorithm>
 
@@ -38,7 +39,7 @@ namespace pipeann {
       QueryBuffer query_buf;
       // search state.
       std::vector<Neighbor> full_retset;
-      std::vector<Neighbor> retset;
+      CandidatePool<> pool;
       tsl::robin_set<uint64_t> visited;
 
       std::vector<unsigned> frontier;
@@ -47,32 +48,35 @@ namespace pipeann {
       std::vector<IORequest> frontier_read_reqs;
 
       SSDIndex<T> *parent;
-      unsigned cur_list_size, cmps, k;
+      unsigned cmps;
+      // A batch has been issued but not yet explored. Termination must wait for
+      // it: visited is set at pick time, so first_unvisited_ (all_visited) runs
+      // ahead of the neighbors an outstanding batch will still insert.
+      bool outstanding;
 
       void print() {
-        LOG(INFO) << "Full retset size " << full_retset.size() << " retset size: " << retset.size()
+        LOG(INFO) << "Full retset size " << full_retset.size() << " retset size: " << pool.size()
                   << " visited size: " << visited.size() << " frontier size: " << frontier.size()
                   << " frontier nhood size: " << frontier_nhoods.size()
                   << " frontier read reqs size: " << frontier_read_reqs.size();
       }
 
-      void reset() {
+      void reset(uint64_t l_search) {
         sector_idx = 0;
         visited.clear();  // does not deallocate memory.
-        retset.resize(4096);
-        retset.clear();
+        pool.reset(l_search, l_search + 1);
         full_retset.clear();
-        cur_list_size = cmps = k = 0;
+        cmps = 0;
+        outstanding = false;
       }
 
       void compute_and_add_to_retset(const unsigned *node_ids, const uint64_t n_ids) {
         parent->nbr_handler->compute_dists(&query_buf, node_ids, n_ids);
         for (uint64_t i = 0; i < n_ids; ++i) {
-          auto &item = retset[cur_list_size];
-          item.id = node_ids[i];
-          item.distance = query_buf.aligned_dist_scratch[i];
-          item.flag = true;
-          cur_list_size++;
+          // Unfiltered search: seeds and expansion nodes share is_member_approx so
+          // the pool stays monotone in distance (is_member_approx is the primary
+          // sort key and is meaningful only for in-filter search).
+          pool.insert(Neighbor(node_ids[i], query_buf.aligned_dist_scratch[i]));
           visited.insert(node_ids[i]);
         }
       };
@@ -87,15 +91,15 @@ namespace pipeann {
         frontier_read_reqs.clear();
         sector_idx = 0;
 
-        uint32_t marker = k;
-        uint32_t num_seen = 0;
-        while (marker < cur_list_size && frontier.size() < beam_width && num_seen < beam_width) {
-          if (retset[marker].flag) {
-            num_seen++;
-            frontier.push_back(retset[marker].id);
-            retset[marker].flag = false;
+        // Pick the closest not-yet-visited candidates, marking them visited at
+        // pick time. Reads land in a later step, so termination is gated on
+        // `outstanding` rather than on the visited frontier alone.
+        for (uint32_t num_seen = 0; num_seen < beam_width; ++num_seen) {
+          Neighbor *node = pool.next_unvisited();
+          if (node == nullptr) {
+            break;
           }
-          marker++;
+          frontier.push_back(node->id);
         }
 
         // read nhoods of frontier ids
@@ -112,6 +116,7 @@ namespace pipeann {
             frontier_read_reqs.emplace_back(IORequest(offset, parent->io_size, sector_buf, 0, 0));
           }
           parent->reader->send_io(frontier_read_reqs, ctx, false);
+          outstanding = true;
         }
       }
 
@@ -126,8 +131,6 @@ namespace pipeann {
       }
 
       void explore_frontier(uint64_t l_search) {
-        auto nk = cur_list_size;
-
         for (auto &frontier_nhood : frontier_nhoods) {
           auto [id, loc, sector_buf] = frontier_nhood;
           auto node = parent->node_from_page(sector_buf, loc);
@@ -137,7 +140,7 @@ namespace pipeann {
           float cur_expanded_dist =
               parent->dist_cmp->compare(query, node_fp_coords_copy, (unsigned) parent->aligned_dim);
 
-          Neighbor n(id, cur_expanded_dist, true);
+          Neighbor n(id, cur_expanded_dist);
           full_retset.push_back(n);
 
           // compute node_nbrs <-> query dist in PQ space
@@ -152,33 +155,16 @@ namespace pipeann {
               visited.insert(id);
               cmps++;
               float dist = query_buf.aligned_dist_scratch[m];
-              if (dist >= retset[cur_list_size - 1].distance && (cur_list_size == l_search))
-                continue;
-              Neighbor nn(id, dist, true);
-              // variable search_L for deleted nodes.
-              // Return position in sorted list where nn inserted.
-
-              auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
-
-              if (cur_list_size < l_search) {
-                ++cur_list_size;
-              }
-
-              if (r < nk)
-                nk = r;
+              pool.insert(Neighbor(id, dist));
             }
           }
         }
-
-        if (nk <= k)
-          k = nk;  // k is the best position in retset updated in this round.
-        else
-          ++k;
+        outstanding = false;
       }
 
       bool search_ends() {
         // this->print();
-        return k >= cur_list_size;
+        return pool.all_visited() && !outstanding;
       }
     };
 
@@ -221,7 +207,7 @@ namespace pipeann {
       // query <-> PQ chunk centers distances
       nbr_handler->initialize_query(query, &coro_data.query_buf);
 
-      coro_data.reset();
+      coro_data.reset(l_search);
 
       if (mem_L) {
         std::vector<unsigned> mem_tags(mem_L);
@@ -232,7 +218,6 @@ namespace pipeann {
         // Do not use optimized start point.
         coro_data.compute_and_add_to_retset(&meta_.entry_point_id, 1);
       }
-      std::sort(coro_data.retset.begin(), coro_data.retset.begin() + coro_data.cur_list_size);
     }
 
     // SEARCH!
