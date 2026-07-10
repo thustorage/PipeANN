@@ -110,7 +110,14 @@ namespace pipeann::dsl {
       }
 
       if (ops.count("$in")) {
-        const auto &items = ops.at("$in").get<picojson::array>();
+        const auto &val_node = ops.at("$in");
+        // "$$var" placeholder bound to a per-query .spmat (the benchmark path):
+        // mirror the $all handling below. Only meaningful for label fields.
+        if (info.type == "label" && val_node.is<std::string>() && is_placeholder(val_node.get<std::string>())) {
+          uint32_t slot = alloc_placeholder_slot(cf, placeholder_name(val_node.get<std::string>()), info.type);
+          return new LabelOrSelector(slot, info.key, info.attr_index);
+        }
+        const auto &items = val_node.get<picojson::array>();
         if (info.type == "label") {
           Attribute vals;
           for (const auto &item : items)

@@ -176,9 +176,46 @@ namespace pipeann {
     std::vector<uint8_t> data;
     FixedChunkPQTable<T> pq_table;
 
+    // The gather below is one random DRAM access per id into the multi-GB
+    // compressed array; without prefetch each iteration stalls on the miss.
+    // Prefetch kAggPrefetchDist ids ahead (both cachelines an entry can span)
+    // to overlap the misses.
+    static constexpr uint64_t kAggPrefetchDist = 8;
+
+    template<uint64_t kFixedDims>
+    inline void aggregate_coords_fixed(const unsigned *ids, const uint64_t n_ids, const uint8_t *all_coords,
+                                       uint8_t *out) {
+      for (uint64_t i = 0; i < n_ids; i++) {
+        if (i + kAggPrefetchDist < n_ids) {
+          pipeann::cpu_prefetch_t0(all_coords + ids[i + kAggPrefetchDist] * kFixedDims);
+        }
+        // Constant size: inlines to vector loads/stores instead of a libc
+        // memmove call per id.
+        memcpy(out + i * kFixedDims, all_coords + ids[i] * kFixedDims, kFixedDims);
+      }
+    }
+
     inline void aggregate_coords(const unsigned *ids, const uint64_t n_ids, const uint8_t *all_coords,
                                  const uint64_t ndims, uint8_t *out) {
+      for (uint64_t i = 0; i < n_ids && i < kAggPrefetchDist; i++) {
+        pipeann::cpu_prefetch_t0(all_coords + ids[i] * ndims);
+      }
+      switch (ndims) {
+        case 16:
+          return aggregate_coords_fixed<16>(ids, n_ids, all_coords, out);
+        case 32:
+          return aggregate_coords_fixed<32>(ids, n_ids, all_coords, out);
+        case 64:
+          return aggregate_coords_fixed<64>(ids, n_ids, all_coords, out);
+        case 128:
+          return aggregate_coords_fixed<128>(ids, n_ids, all_coords, out);
+        default:
+          break;
+      }
       for (uint64_t i = 0; i < n_ids; i++) {
+        if (i + kAggPrefetchDist < n_ids) {
+          pipeann::cpu_prefetch_t0(all_coords + ids[i + kAggPrefetchDist] * ndims);
+        }
         memcpy(out + i * ndims, all_coords + ids[i] * ndims, ndims * sizeof(uint8_t));
       }
     }

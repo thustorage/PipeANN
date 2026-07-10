@@ -49,6 +49,48 @@ namespace pipeann {
     // Fast in-memory approximate membership check during graph traversal.
     // No false negatives: returns false only if the vector is definitely invalid.
     virtual bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) = 0;
+
+    // Prefetch the memory that is_member_approx(target_id) will touch (e.g. the
+    // per-vector bucket-id / bloom-filter cacheline), so a later call hits cache.
+    // The membership check over a node's neighbors is dominated by this random
+    // access into a per-vector array sized with the dataset (~1GB for 1e9 pts),
+    // so software-prefetching a few neighbors ahead hides the miss latency.
+    // Default no-op: selectors whose check is already cache-resident skip it.
+    virtual void prefetch_approx(uint32_t /*target_id*/, const Attributes & /*query_attrs*/) {}
+
+    // Hold the underlying attr indexes' shared locks across a whole in-filter
+    // traversal, so per-neighbor is_member_approx calls run lock-free (the
+    // per-call lock/unlock pair was ~24% of in-filter CPU). Excludes concurrent
+    // merge (exclusive lock); a merge now waits for in-flight queries (~ms),
+    // same order as before. Call AFTER prepare_in_filter (which takes the same
+    // locks internally). attr_indexes_ is populated at construction (see below).
+    void lock_shared() {
+      for (auto *index : attr_indexes_) {
+        index->lock_shared();
+      }
+    }
+
+    void unlock_shared() {
+      for (auto *index : attr_indexes_) {
+        index->unlock_shared();
+      }
+    }
+
+   protected:
+    // The AttrIndexes whose in-memory structures is_member_approx reads. Leaf
+    // selectors seed this with their own index at construction; composites merge
+    // their children's via merge_attr_indexes(). NotSelector reads only its own
+    // prepared list, so it contributes nothing. Deduplicated: several leaves may
+    // share one AttrIndex, and re-locking a shared_mutex on the same thread is UB.
+    std::vector<AttrIndex *> attr_indexes_;
+
+    void merge_attr_indexes(const Selector *child) {
+      for (auto *index : child->attr_indexes_) {
+        if (std::find(attr_indexes_.begin(), attr_indexes_.end(), index) == attr_indexes_.end()) {
+          attr_indexes_.push_back(index);
+        }
+      }
+    }
   };
 
   struct LabelOrSelector : public Selector {
@@ -58,6 +100,7 @@ namespace pipeann {
     VectorIDList cold_list_;
     LabelOrSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
         : key_(key), base_key_(base_key), attr_index_(attr_index) {
+      attr_indexes_.push_back(attr_index_);
     }
 
     // Leaf selectors only need a shallow copy because AttrIndex ownership is
@@ -108,6 +151,10 @@ namespace pipeann {
     virtual bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
       return attr_index_->is_member_approx(target_id, query_attrs.get(key_), cold_list_);
     }
+
+    virtual void prefetch_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      attr_index_->prefetch_approx(target_id, query_attrs.get(key_), cold_list_);
+    }
   };
 
   struct LabelAndSelector : public Selector {
@@ -117,6 +164,7 @@ namespace pipeann {
     VectorIDList cold_list_;
     LabelAndSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
         : key_(key), base_key_(base_key), attr_index_(attr_index) {
+      attr_indexes_.push_back(attr_index_);
     }
 
     // Leaf selectors only need a shallow copy because AttrIndex ownership is
@@ -171,6 +219,10 @@ namespace pipeann {
     virtual bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
       return inv_store()->is_member_approx_and(target_id, query_attrs.get(key_), cold_list_);
     }
+
+    virtual void prefetch_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      attr_index_->prefetch_approx(target_id, query_attrs.get(key_), cold_list_);
+    }
   };
 
   struct RangeSelector : public Selector {
@@ -181,6 +233,7 @@ namespace pipeann {
 
     RangeSelector(uint32_t key, uint32_t base_key, AttrIndex *attr_index)
         : key_(key), base_key_(base_key), attr_index_(attr_index) {
+      attr_indexes_.push_back(attr_index_);
     }
 
     // Leaf selectors only need a shallow copy because AttrIndex ownership is
@@ -227,6 +280,10 @@ namespace pipeann {
     virtual bool is_member_approx(uint32_t target_id, const Attributes &query_attrs) override {
       return attr_index_->is_member_approx(target_id, query_attrs.get(key_), prepared_list_);
     }
+
+    virtual void prefetch_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      attr_index_->prefetch_approx(target_id, query_attrs.get(key_), prepared_list_);
+    }
   };
 
   struct AndSelector : public Selector {
@@ -235,6 +292,7 @@ namespace pipeann {
 
     AndSelector(std::vector<Selector *> selectors) {
       for (auto &selector : selectors) {
+        merge_attr_indexes(selector);
         selectors_.push_back(std::make_pair(selector, 1.0));
       }
     }
@@ -333,11 +391,20 @@ namespace pipeann {
       }
       return true;
     }
+
+    virtual void prefetch_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      for (auto &ss : selectors_) {
+        ss.first->prefetch_approx(target_id, query_attrs);
+      }
+    }
   };
 
   struct OrSelector : public Selector {
     std::vector<Selector *> selectors_;
     OrSelector(std::vector<Selector *> selectors) : selectors_(std::move(selectors)) {
+      for (auto *selector : selectors_) {
+        merge_attr_indexes(selector);
+      }
     }
 
     // The parent OrSelector owns and deletes its children, so we deep-copy
@@ -432,6 +499,12 @@ namespace pipeann {
       }
       return false;
     }
+
+    virtual void prefetch_approx(uint32_t target_id, const Attributes &query_attrs) override {
+      for (auto &selector : selectors_) {
+        selector->prefetch_approx(target_id, query_attrs);
+      }
+    }
   };
 
   struct NotSelector : public Selector {
@@ -525,6 +598,7 @@ namespace pipeann {
       if (attr_index_ == nullptr) {
         throw std::runtime_error("StringEqSelector requires a StringAttrIndex");
       }
+      attr_indexes_.push_back(attr_index_);
     }
 
     Selector *copy() const override {

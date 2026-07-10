@@ -363,10 +363,10 @@ namespace pipeann {
                         std::vector<Neighbor> &expanded_nodes_info, QueryStats *stats = nullptr,
                         InsertContext *insert_ctx = nullptr, NodeOut *node_out = nullptr);
 
-    template<typename SpecFn, typename VerifyFn>
+    template<typename SpecFn, typename VerifyFn, typename PrefetchFn>
     void pipe_search_common(const T *query, uint64_t k_search, uint32_t mem_L, uint64_t l_search, uint64_t l_pool,
                             uint64_t beam_width, bool use_dense_nbrs, SpecFn is_member_approx, VerifyFn is_member,
-                            std::vector<Neighbor> &full_retset, QueryStats *stats = nullptr,
+                            PrefetchFn prefetch_approx, std::vector<Neighbor> &full_retset, QueryStats *stats = nullptr,
                             InsertContext *insert_ctx = nullptr,
                             float range_partial = std::numeric_limits<float>::infinity(), NodeOut *node_out = nullptr);
 

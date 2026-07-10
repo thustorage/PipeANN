@@ -299,6 +299,22 @@ namespace pipeann {
     // The `list` parameter contains pre-scanned cold-attribute matches from prepare_in_filter().
     virtual bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &list) = 0;
 
+    // Prefetch the cacheline is_member_approx(target_id) will read (per-vector
+    // bucket id / bloom filter). Default no-op; overridden by indexes whose check
+    // is a random probe into a dataset-sized array.
+    virtual void prefetch_approx(uint32_t /*target_id*/, const Attribute & /*query*/, const VectorIDList & /*list*/) {}
+
+    // In-filter search pins this for the whole graph traversal (see
+    // Selector::lock_shared) instead of locking inside every is_member_approx
+    // call; per-call lock/unlock pairs were ~24% of in-filter CPU. Excludes
+    // concurrent merge (exclusive); a merge waits for in-flight queries (~ms).
+    void lock_shared() {
+      delta_attrs_mu_.lock_shared();
+    }
+    void unlock_shared() {
+      delta_attrs_mu_.unlock_shared();
+    }
+
    protected:
     static uint64_t atomic_max(std::atomic<uint64_t> &target, uint64_t value) {
       uint64_t old_value = target;
@@ -749,20 +765,23 @@ namespace pipeann {
       }
 
       // For hot labels, use bloom filter to check if query in target_id's labels.
-      size_t lock_idx = portable_thread_id();
-      delta_attrs_mu_.lock_shared(lock_idx);
+      // No locking here: the caller holds lock_shared() across the traversal.
       auto bf = get_bloom_filter(target_id);
       for (auto &label : query) {
         if (is_cold_label(label)) {
           continue;
         }
         if (bf.contains(label)) {
-          delta_attrs_mu_.unlock_shared(lock_idx);
           return true;
         }
       }
-      delta_attrs_mu_.unlock_shared(lock_idx);
       return false;
+    }
+
+    // Prefetch the per-vector bloom filter bytes (random probe into bloom_filters_,
+    // sized bloom_bytes_per_point_ * n_vectors) that is_member_approx will read.
+    void prefetch_approx(uint32_t target_id, const Attribute & /*query*/, const VectorIDList & /*cold*/) override {
+      pipeann::cpu_prefetch_t0(&bloom_filters_[(size_t) target_id * bloom_bytes_per_point_]);
     }
 
     // ---- AND semantics: all query labels must be present ----
@@ -900,19 +919,16 @@ namespace pipeann {
       }
 
       // All hot labels must pass bloom filter.
-      size_t lock_idx = portable_thread_id();
-      delta_attrs_mu_.lock_shared(lock_idx);
+      // No locking here: the caller holds lock_shared() across the traversal.
       auto bf = get_bloom_filter(target_id);
       for (auto &label : query) {
         if (is_cold_label(label)) {
           continue;
         }
         if (!bf.contains(label)) {
-          delta_attrs_mu_.unlock_shared(lock_idx);
           return false;
         }
       }
-      delta_attrs_mu_.unlock_shared(lock_idx);
       return true;
     }
 
@@ -1279,17 +1295,21 @@ namespace pipeann {
     // Approximate membership test using quantized bucket IDs.
     // A vector is considered a member if its bucket range overlaps with the query range.
     bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &list) override {
-      size_t lock_idx = portable_thread_id();
-      delta_attrs_mu_.lock_shared(lock_idx);
+      // No locking here: the caller holds lock_shared() across the traversal.
       uint32_t l = query[0], r = query.size() > 1 ? query[1] : l + 1;
       // Use quantized bucket check if available.
       uint8_t bid = bucket_ids_[target_id];
 
       // Bucket bid covers [bucket_boundaries_[bid], bucket_boundaries_[bid+1]).
       // Check if this range overlaps with [l, r).
-      bool ret = bucket_boundaries_[bid] < r && bucket_boundaries_[bid + 1] > l;
-      delta_attrs_mu_.unlock_shared(lock_idx);
-      return ret;
+      return bucket_boundaries_[bid] < r && bucket_boundaries_[bid + 1] > l;
+    }
+
+    // The dominant cost of is_member_approx is this random probe into bucket_ids_
+    // (uint8_t per vector; ~1GB at 1e9 pts). Prefetch its cacheline so the check
+    // a few neighbors later hits L1/L2 instead of stalling on a memory read.
+    void prefetch_approx(uint32_t target_id, const Attribute & /*query*/, const VectorIDList & /*list*/) override {
+      pipeann::cpu_prefetch_t0(&bucket_ids_[target_id]);
     }
 
    private:
@@ -1879,11 +1899,8 @@ namespace pipeann {
     // --- is_member_approx ---
 
     bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &) override {
-      size_t lock_idx = portable_thread_id();
-      delta_attrs_mu_.lock_shared(lock_idx);
-      bool ret = target_id < hashes_.size() && hashes_[target_id] == hash_packed(query);
-      delta_attrs_mu_.unlock_shared(lock_idx);
-      return ret;
+      // No locking here: the caller holds lock_shared() across the traversal.
+      return target_id < hashes_.size() && hashes_[target_id] == hash_packed(query);
     }
 
     bool is_member_approx(uint32_t target_id, const Attribute &query, const VectorIDList &, Direction dir) {

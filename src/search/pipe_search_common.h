@@ -23,11 +23,17 @@ namespace pipeann {
   //     pipe_search: always return true.
   //     filter search: selector->is_member(id, query_attrs, target_attrs).
   //
+  //   PrefetchFn: (unsigned id) -> void
+  //     Prefetch the memory is_member_approx(id) will read. Called a few neighbors
+  //     ahead of the membership check to hide the random-access miss.
+  //     pipe_search / post_filter: no-op.
+  //     in_filter: selector->prefetch_approx(id, query_attrs).
+  //
   template<typename T, typename TagT>
-  template<typename SpecFn, typename VerifyFn>
+  template<typename SpecFn, typename VerifyFn, typename PrefetchFn>
   void SSDIndex<T, TagT>::pipe_search_common(const T *query1, uint64_t k_search, uint32_t mem_L, uint64_t l_search,
                                              uint64_t l_pool, uint64_t beam_width, bool use_dense_nbrs,
-                                             SpecFn is_member_approx, VerifyFn is_member,
+                                             SpecFn is_member_approx, VerifyFn is_member, PrefetchFn prefetch_approx,
                                              std::vector<Neighbor> &full_retset, QueryStats *stats,
                                              InsertContext *insert_ctx, float range_partial, NodeOut *node_out) {
     QueryBuffer *query_buf = pop_query_buf(query1);
@@ -125,8 +131,22 @@ namespace pipeann {
       // loops, no extra pass): match/seen is this node's local member density.
       uint64_t seen = 0, match = 0;
 
+      // Prefetch-ahead distance: is_member_approx randomly probes a per-vector array
+      // (bucket id / bloom filter) sized with the dataset, so each check risks a cache
+      // miss. Prefetching the neighbor kPrefetchDist ahead overlaps that miss with the
+      // current check's work. No-op for non-filter searches (prefetch_approx is empty).
+      // 8 measured best on SIFT1B (deeper prefetch evicts before use).
+      constexpr unsigned kPrefetchDist = 8;
+
       // 1-hop neighbors that are approximate members.
+      for (unsigned m = 0; m < node.nnbrs && m < kPrefetchDist; ++m) {
+        prefetch_approx(node.nbrs[m]);
+      }
+
       for (unsigned m = 0; m < node.nnbrs && nbors_cand_size < node.nnbrs; ++m, ++seen) {
+        if (m + kPrefetchDist < node.nnbrs) {
+          prefetch_approx(node.nbrs[m + kPrefetchDist]);
+        }
         if (is_member_approx(node.nbrs[m])) {
           ++match;
           if (visited.insert(node.nbrs[m]).second) {
@@ -140,7 +160,14 @@ namespace pipeann {
       // Only valid for in-filter search where dense neighbors were actually read from disk.
       if (use_dense_nbrs) {
         // 2-hop (dense) neighbors that are approximate members.
+        for (unsigned m = 0; m < node.n_dense_nbrs && m < kPrefetchDist; ++m) {
+          prefetch_approx(node.dense_nbrs[m]);
+        }
+
         for (unsigned m = 0; m < node.n_dense_nbrs && nbors_cand_size < node.nnbrs; ++m, ++seen) {
+          if (m + kPrefetchDist < node.n_dense_nbrs) {
+            prefetch_approx(node.dense_nbrs[m + kPrefetchDist]);
+          }
           if (is_member_approx(node.dense_nbrs[m])) {
             ++match;
             if (visited.insert(node.dense_nbrs[m]).second) {
