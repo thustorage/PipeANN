@@ -2,6 +2,7 @@
 
 #include "utils.h"
 #include "utils/tsl/robin_set.h"
+#include "utils/visited_set.h"
 
 constexpr size_t MAX_N_SECTOR_READS = 128;
 constexpr size_t MAX_N_EDGES = 2048;
@@ -242,7 +243,10 @@ namespace pipeann {
     uint8_t *aligned_query_ = nullptr;      // MUST BE AT LEAST [aligned_dim * sizeof(T)], for aligned query.
     char *update_buf = nullptr;             // Dynamic allocate in insert_in_place.
 
-    tsl::robin_set<uint64_t> *visited = nullptr;
+    // Prefetchable visited set (see visited_set.h): insert-only, the probe
+    // address is a pure function of the id so the search loop can prefetch a
+    // neighbor's slot a few iterations ahead of insert() and hide the miss.
+    FlatVisitedSet *visited = nullptr;
     tsl::robin_set<unsigned> *page_visited = nullptr;
     IORequest reqs[MAX_N_SECTOR_READS];
 

@@ -19,10 +19,11 @@ namespace pipeann {
                                          const uint64_t beam_width, std::vector<Neighbor> &expanded_nodes_info,
                                          QueryStats *stats, InsertContext *insert_ctx, NodeOut *node_out) {
     auto always_member = [](unsigned) -> bool { return true; };
-    auto always_valid = [](unsigned, const DiskNode<T> &) -> bool { return true; };
     auto no_prefetch = [](unsigned) {};
+    // VerifyFn = AlwaysTrue is a type-level signal: pipe_search_common detects
+    // it (is_same_v) and switches terminate() to the O(1) member count.
     this->pipe_search_common(query, k_search, mem_L, l_search, l_search, beam_width, false, always_member,
-                             always_valid, no_prefetch, expanded_nodes_info, stats, insert_ctx,
+                             AlwaysTrue(), no_prefetch, expanded_nodes_info, stats, insert_ctx,
                              std::numeric_limits<float>::infinity(), node_out);
   }
 
@@ -42,13 +43,12 @@ namespace pipeann {
                                          QueryStats *stats) {
     std::shared_lock lk(merge_lock);
     auto always_member = [](unsigned) -> bool { return true; };
-    auto always_valid = [](unsigned, const DiskNode<T> &) -> bool { return true; };
     auto no_prefetch = [](unsigned) {};
 
     const float range_partial = get_partial_order_distance<T>(range, this->metric);
     std::vector<Neighbor> full_retset;
     this->pipe_search_common(query, l_search, mem_L, l_search, l_search, beam_width, false, always_member,
-                             always_valid, no_prefetch, full_retset, stats, nullptr, range_partial);
+                             AlwaysTrue(), no_prefetch, full_retset, stats, nullptr, range_partial);
     return copy_top_k(full_retset, l_search, res_tags, res_dists, range_partial);
   }
 

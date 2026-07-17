@@ -48,6 +48,13 @@ namespace pipeann {
     }
     virtual void initialize_query(const T *query, QueryBuffer *query_buf) {
     }
+    // (base, stride) of the compressed-vector array, for caller-side inline
+    // prefetch of the vector compute_dists() will gather for an id: the caller
+    // captures this once per query and issues cpu_prefetch_t0(base + id * stride)
+    // itself, avoiding a virtual call per neighbor.
+    virtual std::pair<const uint8_t *, uint64_t> vec_prefetch_info() const {
+      return {nullptr, 0};
+    }
     // Compute dists using assymetric distance computation.
     virtual void compute_dists(QueryBuffer *query_buf, const uint32_t *ids, const uint64_t n_ids) {
     }

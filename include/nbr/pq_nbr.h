@@ -47,6 +47,14 @@ namespace pipeann {
       return abs_nbr_handler;
     }
 
+    // Expose the compressed-vector array for caller-side inline prefetch (see
+    // AbstractNeighbor::vec_prefetch_info). The pointer may go stale if a
+    // concurrent insert() resizes `data`, but a prefetch of a stale address is
+    // architecturally harmless and the real access still runs under pq_mu.
+    std::pair<const uint8_t *, uint64_t> vec_prefetch_info() const override {
+      return {data.data(), pq_table.n_chunks};
+    }
+
     // For PQ, out-buffer is filled with PQ table distances.
     void initialize_query(const T *query, QueryBuffer *query_buf) {
       return pq_table.populate_chunk_distances(query, query_buf->nbr_ctx_scratch);
@@ -227,24 +235,49 @@ namespace pipeann {
       pipeann::cpu_prefetch_nta((char *) (ptr + 192));
     }
 
+    // Point-major, 8-point-blocked table accumulation. The distance table
+    // (n_chunks KB) is L1/L2-resident and each point's codes stream
+    // sequentially, so the binding constraint is load-port throughput: keeping
+    // the 8 accumulators in registers does 2 loads per (point, chunk) versus
+    // 3 loads + 1 store for the classic chunk-major loop (~2x). Per point the
+    // chunks are still accumulated in increasing order, so results are
+    // bit-identical to the chunk-major form.
     inline void pq_dist_lookup(const uint8_t *pq_ids, const uint64_t n_pts, const uint64_t pq_nchunks,
                                const float *pq_dists, float *dists_out) {
-      pipeann::cpu_prefetch_t0((char *) dists_out);
       pipeann::cpu_prefetch_t0((char *) pq_ids);
-      pipeann::cpu_prefetch_t0((char *) (pq_ids + 64));
-      pipeann::cpu_prefetch_t0((char *) (pq_ids + 128));
-
       prefetch_chunk_dists(pq_dists);
-      memset(dists_out, 0, n_pts * sizeof(float));
-      for (uint64_t chunk = 0; chunk < pq_nchunks; chunk++) {
-        const float *chunk_dists = pq_dists + 256 * chunk;
-        if (chunk < pq_nchunks - 1) {
-          prefetch_chunk_dists(chunk_dists + 256);
+
+      uint64_t i = 0;
+      for (; i + 8 <= n_pts; i += 8) {
+        const uint8_t *c = pq_ids + i * pq_nchunks;
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+        for (uint64_t chunk = 0; chunk < pq_nchunks; chunk++) {
+          const float *cd = pq_dists + 256 * chunk;
+          a0 += cd[c[chunk]];
+          a1 += cd[c[pq_nchunks + chunk]];
+          a2 += cd[c[2 * pq_nchunks + chunk]];
+          a3 += cd[c[3 * pq_nchunks + chunk]];
+          a4 += cd[c[4 * pq_nchunks + chunk]];
+          a5 += cd[c[5 * pq_nchunks + chunk]];
+          a6 += cd[c[6 * pq_nchunks + chunk]];
+          a7 += cd[c[7 * pq_nchunks + chunk]];
         }
-        for (uint64_t idx = 0; idx < n_pts; idx++) {
-          uint8_t pq_centerid = pq_ids[pq_nchunks * idx + chunk];
-          dists_out[idx] += chunk_dists[pq_centerid];
+        dists_out[i + 0] = a0;
+        dists_out[i + 1] = a1;
+        dists_out[i + 2] = a2;
+        dists_out[i + 3] = a3;
+        dists_out[i + 4] = a4;
+        dists_out[i + 5] = a5;
+        dists_out[i + 6] = a6;
+        dists_out[i + 7] = a7;
+      }
+      for (; i < n_pts; i++) {
+        const uint8_t *c = pq_ids + i * pq_nchunks;
+        float a = 0;
+        for (uint64_t chunk = 0; chunk < pq_nchunks; chunk++) {
+          a += pq_dists[256 * chunk + c[chunk]];
         }
+        dists_out[i] = a;
       }
     }
 

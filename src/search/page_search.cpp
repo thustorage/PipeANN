@@ -52,7 +52,7 @@ namespace pipeann {
 
     Timer query_timer, io_timer, cpu_timer;
     CandidatePool pool(l_search, l_search + 1);
-    tsl::robin_set<uint64_t> &visited = *(query_buf->visited);
+    FlatVisitedSet &visited = *(query_buf->visited);
     tsl::robin_set<unsigned> &page_visited = *(query_buf->page_visited);
 
     std::vector<Neighbor> full_retset;
@@ -71,9 +71,8 @@ namespace pipeann {
       unsigned nnbrs = node.nnbrs;
       unsigned nbors_cand_size = 0;
       for (unsigned m = 0; m < nnbrs; ++m) {
-        if (visited.find(node_nbrs[m]) == visited.end()) {
+        if (visited.insert(node_nbrs[m])) {
           node_nbrs[nbors_cand_size++] = node_nbrs[m];
-          visited.insert(node_nbrs[m]);
         }
       }
       if (nbors_cand_size) {

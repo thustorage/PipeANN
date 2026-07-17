@@ -2,6 +2,7 @@
 // Included by pipe_search.cpp and spec_filter_search.cpp which provide all necessary headers.
 
 #include <limits>
+#include <type_traits>
 #ifdef USE_URING
 #include "liburing.h"
 #endif
@@ -67,6 +68,9 @@ namespace pipeann {
     // consults it (through the ready predicate below) to pick the next candidate
     // to exact-rank and to skip re-reads.
     std::unordered_map<unsigned, DiskNode<T>> id_buf_map;
+    // Sized to the deepest plausible set of landed-but-unexpanded pages so the
+    // hot-loop inserts never rehash.
+    id_buf_map.reserve(MAX_N_SECTOR_READS);
 
     // The candidate pool (approx members = TP+FP, plus promoted bridges), capped
     // at l_pool = in_filter_l_eq so it has room for the FP headroom needed to
@@ -122,6 +126,18 @@ namespace pipeann {
       return true;
     };
 
+    // Inline prefetch of the compressed vector compute_dists will gather for a
+    // just-collected id: issued during collection, the random DRAM access is
+    // long resolved by the time the distance kernel runs.
+    const auto [pq_vec_base, pq_vec_stride] = nbr_handler->vec_prefetch_info();
+    auto prefetch_pq_vec = [&](unsigned id) {
+      if (pq_vec_base != nullptr) {
+        const uint8_t *p = pq_vec_base + (uint64_t) id * pq_vec_stride;
+        pipeann::cpu_prefetch_t0(p);
+        pipeann::cpu_prefetch_t0(p + pq_vec_stride - 1);  // same line unless the entry straddles
+      }
+    };
+
     // --- Unified neighbor expansion (1-hop approx -> 2-hop approx -> 1-hop connectivity) ---
     uint64_t n_computes = 0;
     auto compute_and_push_nbrs = [&](DiskNode<T> &node) {
@@ -141,15 +157,18 @@ namespace pipeann {
       // 1-hop neighbors that are approximate members.
       for (unsigned m = 0; m < node.nnbrs && m < kPrefetchDist; ++m) {
         prefetch_approx(node.nbrs[m]);
+        visited.prefetch(node.nbrs[m]);
       }
 
       for (unsigned m = 0; m < node.nnbrs && nbors_cand_size < node.nnbrs; ++m, ++seen) {
         if (m + kPrefetchDist < node.nnbrs) {
           prefetch_approx(node.nbrs[m + kPrefetchDist]);
+          visited.prefetch(node.nbrs[m + kPrefetchDist]);
         }
         if (is_member_approx(node.nbrs[m])) {
           ++match;
-          if (visited.insert(node.nbrs[m]).second) {
+          if (visited.insert(node.nbrs[m])) {
+            prefetch_pq_vec(node.nbrs[m]);
             nbr_ids[nbors_cand_size++] = node.nbrs[m];
           }
         }
@@ -162,15 +181,18 @@ namespace pipeann {
         // 2-hop (dense) neighbors that are approximate members.
         for (unsigned m = 0; m < node.n_dense_nbrs && m < kPrefetchDist; ++m) {
           prefetch_approx(node.dense_nbrs[m]);
+          visited.prefetch(node.dense_nbrs[m]);
         }
 
         for (unsigned m = 0; m < node.n_dense_nbrs && nbors_cand_size < node.nnbrs; ++m, ++seen) {
           if (m + kPrefetchDist < node.n_dense_nbrs) {
             prefetch_approx(node.dense_nbrs[m + kPrefetchDist]);
+            visited.prefetch(node.dense_nbrs[m + kPrefetchDist]);
           }
           if (is_member_approx(node.dense_nbrs[m])) {
             ++match;
-            if (visited.insert(node.dense_nbrs[m]).second) {
+            if (visited.insert(node.dense_nbrs[m])) {
+              prefetch_pq_vec(node.dense_nbrs[m]);
               nbr_ids[nbors_cand_size++] = node.dense_nbrs[m];
             }
           }
@@ -178,7 +200,8 @@ namespace pipeann {
         n_member = nbors_cand_size;
         // Remaining 1-hop neighbors for connectivity.
         for (unsigned m = 0; m < node.nnbrs && nbors_cand_size < node.nnbrs; ++m) {
-          if (visited.insert(node.nbrs[m]).second) {
+          if (visited.insert(node.nbrs[m])) {
+            prefetch_pq_vec(node.nbrs[m]);
             nbr_ids[nbors_cand_size++] = node.nbrs[m];
           }
         }
@@ -187,20 +210,18 @@ namespace pipeann {
       n_computes += nbors_cand_size;
       if (nbors_cand_size) {
         nbr_handler->compute_dists(query_buf, nbr_ids, nbors_cand_size);
-        for (unsigned m = 0; m < nbors_cand_size; ++m) {
-          const int nbor_id = nbr_ids[m];
-          const float nbor_dist = dist_scratch[m];
-          if (stats != nullptr) {
-            stats->n_cmps++;
-          }
+        if (stats != nullptr) {
+          stats->n_cmps += nbors_cand_size;
+        }
 
-          if (m < n_member) {
-            // Approx member (TP+FP) -> candidate pool.
-            pool.insert(Neighbor(nbor_id, nbor_dist));
-          } else {
-            // Non-member connectivity candidate -> cand_pool (closest kCandCap kept).
-            cand_pool.insert(Neighbor(nbor_id, nbor_dist));
-          }
+        // Approx members (TP+FP) [0, n_member) -> candidate pool, merged as one
+        // sorted batch so the pool tail shifts once per expansion instead of
+        // once per accepted candidate.
+        pool.insert_batch(nbr_ids, dist_scratch, n_member);
+
+        // Non-member connectivity candidates -> cand_pool (closest kCandCap kept).
+        for (unsigned m = n_member; m < nbors_cand_size; ++m) {
+          cand_pool.insert(Neighbor(nbr_ids[m], dist_scratch[m]));
         }
 
         // Lightweight edge-fill: on a sparse step (density EMA below gate),
@@ -224,13 +245,6 @@ namespace pipeann {
       }
     };
 
-    auto add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids, float *dists) {
-      for (uint64_t i = 0; i < n_ids; ++i) {
-        visited.insert(node_ids[i]);
-        pool.insert(Neighbor(node_ids[i], dists[i]));
-      }
-    };
-
     // --- Stats init ---
     if (stats != nullptr) {
       stats->io_us = 0;
@@ -245,12 +259,18 @@ namespace pipeann {
     std::vector<unsigned> mem_tags(mem_L);
     std::vector<float> mem_dists(mem_L);
 
-    nbr_handler->initialize_query(query, query_buf);
     if (mem_L) {
+      // Seed with the mem-index distances (already ascending) so the first beam
+      // reads can go out before the PQ query table is built; the build + seed
+      // re-scoring below then overlap the first SSD read.
       mem_index_->search_with_tags_fast(query, mem_L, mem_tags.data(), mem_dists.data());
-      nbr_handler->compute_dists(query_buf, mem_tags.data(), mem_L);
-      add_to_retset(mem_tags.data(), std::min<uint64_t>(mem_L, l_pool), dist_scratch);
+      const uint64_t n_seed = std::min<uint64_t>(mem_L, l_pool);
+      for (uint64_t i = 0; i < n_seed; ++i) {
+        visited.insert(mem_tags[i]);
+        pool.seed(Neighbor(mem_tags[i], mem_dists[i]));
+      }
     } else {
+      nbr_handler->initialize_query(query, query_buf);
       nbr_handler->compute_dists(query_buf, &meta_.entry_point_id, 1);
       visited.insert(meta_.entry_point_id);
       pool.insert(Neighbor(meta_.entry_point_id, dist_scratch[0]));
@@ -277,7 +297,7 @@ namespace pipeann {
 
     auto send_read_req = [&](Neighbor &item) -> bool {
       item.flag = false;
-      this->lock_idx(idx_lock_table, item.id, std::vector<uint32_t>(), true);
+      this->lock_idx(idx_lock_table, item.id, true);
       const unsigned loc = id2loc(item.id), pid = loc_sector_no(loc);
 
       uint64_t &cur_buf_idx = query_buf->sector_idx;
@@ -333,7 +353,10 @@ namespace pipeann {
     // calc_best_node, advanced by the main loop), so it must outlive the lambda.
     unsigned max_marker = 0;
     auto calc_best_node = [&]() -> int {
-      Neighbor *node = pool.next_calc_nbr();
+      // next_calc_nbr can only find work if some landed page is still
+      // unexpanded (id_buf_map non-empty); the O(1) check skips its O(pool)
+      // ready-probe scan on the frequent spins where no IO has landed yet.
+      Neighbor *node = id_buf_map.empty() ? nullptr : pool.next_calc_nbr();
       if (node != nullptr) {
         auto it = id_buf_map.find(node->id);
         auto &[id, dnode] = *it;
@@ -356,6 +379,17 @@ namespace pipeann {
     auto terminate = [&]() -> bool {
       if (pool.first_unvisited() >= pool.size())
         return true;
+      // Exact-members fast path: VerifyFn == AlwaysTrue means every settled
+      // candidate is a member, so the settled-prefix member count IS the prefix
+      // length (first_unvisited, kept current by frontier()). Skips the O(l_search)
+      // prefix scan below, which otherwise runs once per main-loop spin. Only
+      // bypasses the scan when range early-stop is off (the scan also watches
+      // for the range crossing).
+      if constexpr (std::is_same_v<VerifyFn, AlwaysTrue>) {
+        if (approx_range_partial == std::numeric_limits<float>::infinity()) {
+          return pool.first_unvisited() >= l_search;
+        }
+      }
       // Bounded to the contiguous visited (settled) prefix: count is_member, and
       // break early if any entry's distance crosses approx_range_partial. Distance
       // within the prefix is not monotone (sort key is (is_member_approx desc,
@@ -372,7 +406,9 @@ namespace pipeann {
           crossed = true;
           return true;
         }
-        return false;
+        // Enough settled members: the verdict is already "terminate", stop
+        // rescanning the rest of the prefix (it only grows with l_search).
+        return is_member_cnt >= l_search;
       });
       return crossed || is_member_cnt >= l_search;
     };
@@ -380,6 +416,12 @@ namespace pipeann {
     // --- Main search loop ---
     auto cpu2_st = std::chrono::high_resolution_clock::now();
     send_best_read_req(cur_beam_width - on_flight_ios.size());
+
+    if (mem_L) {  // Overlap the PQ query-table build with the first read.
+      nbr_handler->initialize_query(query, query_buf);
+      nbr_handler->compute_dists(query_buf, mem_tags.data(), mem_L);
+      pool.rescore_seeds(dist_scratch);
+    }
     unsigned marker = 0;
 
     int cur_n_in = 0, cur_tot = 0;

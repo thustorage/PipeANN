@@ -132,6 +132,113 @@ namespace pipeann {
       return r;
     }
 
+    // Merge a batch of candidates given as parallel (ids, dists) arrays -- ids
+    // distinct and not already present (the pipe search's visited set
+    // guarantees both) -- in one backward pass. Candidates a full pool rejects
+    // outright (insert()'s early cutoff) are compacted away in place BEFORE the
+    // sort: once the pool is full that is the vast majority, so the insertion
+    // co-sort only ever sees either a small survivor set or the pre-full first
+    // few expansions. Final pool content and markers match calling insert() on
+    // each element. Unlike insert(), slots past size() are not restored to +inf
+    // (overflow parks there), so only callers that never read past size() (the
+    // async pipe search) may use it. Both input arrays are permuted in place.
+    void insert_batch(uint32_t *ids, float *dists, unsigned n) {
+      if (cur_list_size_ == l_pool_) {
+        // Full pool: a candidate no better than the current worst can never
+        // rank inside l_pool of the union (merging only tightens the cut).
+        const Neighbor worst = retset_[cur_list_size_ - 1];
+        unsigned k = 0;
+        for (unsigned i = 0; i < n; ++i) {
+          if (Neighbor(ids[i], dists[i]) < worst) {
+            ids[k] = ids[i];
+            dists[k] = dists[i];
+            ++k;
+          }
+        }
+        n = k;
+      }
+      if (n == 0) {
+        return;
+      }
+      // Co-sort ascending by (distance, id) -- insertion sort; n is small here
+      // (see above), and keeping ids and dists paired needs no Neighbor scratch.
+      for (unsigned i = 1; i < n; ++i) {
+        const uint32_t id = ids[i];
+        const float d = dists[i];
+        unsigned j = i;
+        while (j > 0 && (dists[j - 1] > d || (dists[j - 1] == d && ids[j - 1] > id))) {
+          dists[j] = dists[j - 1];
+          ids[j] = ids[j - 1];
+          --j;
+        }
+        dists[j] = d;
+        ids[j] = id;
+      }
+      // The merged pool keeps only the l_pool_ closest of the union, so trim
+      // the surviving prefix of each list first.
+      unsigned retset_end = cur_list_size_, new_end = n;
+      unsigned tot = cur_list_size_ + n;
+      while (tot > l_pool_) {
+        if (new_end == 0 ||
+            (retset_end > 0 && retset_[retset_end - 1] >= Neighbor(ids[new_end - 1], dists[new_end - 1]))) {
+          --retset_end;  // this pool element falls out of the top l_pool_
+        } else {
+          --new_end;  // this batch candidate does not rank inside the pool
+        }
+        --tot;
+      }
+      if (new_end == 0) {
+        return;  // no batch candidate survives the cut
+      }
+      // Merge batch[0, new_end) into retset_[0, retset_end), placing elements
+      // top-down so each pool segment between two insertion points shifts right
+      // exactly once as a bulk memmove (element-wise merging is ~10x slower).
+      unsigned seg_end = retset_end;  // exclusive end of the unshifted pool prefix
+      for (int j = (int) new_end - 1; j >= 0; --j) {
+        const Neighbor nn(ids[j], dists[j]);
+        const unsigned pj =
+            (unsigned) (std::upper_bound(retset_.data(), retset_.data() + seg_end, nn) - retset_.data());
+        memmove(retset_.data() + pj + j + 1, retset_.data() + pj, (seg_end - pj) * sizeof(Neighbor));
+        retset_[pj + j] = nn;
+        seg_end = pj;
+      }
+      const unsigned lowest = seg_end;  // final index of the closest batch element
+      cur_list_size_ = tot;
+      if (lowest < first_unvisited_) {
+        first_unvisited_ = lowest;
+      }
+      send_marker_ = std::min(send_marker_, lowest);
+    }
+
+    // --- Seed fast-path (pipe_search mem-index seeding) ---
+    //
+    // seed() appends without sorting so the caller can issue the first beam
+    // reads immediately (mem-index order is already ascending) and only then
+    // pay for the PQ query-table build; rescore_seeds() swaps in the PQ
+    // distances afterwards and restores the sorted invariant. This overlaps
+    // the query-table build with the first SSD read instead of serializing
+    // in front of it.
+
+    // Append a seed candidate as-is. Only valid on a fresh pool, before any
+    // insert(); the caller must call rescore_seeds() before relying on sorted
+    // order for anything other than flag-order reads.
+    void seed(Neighbor nn) {
+      retset_[cur_list_size_++] = nn;
+    }
+
+    // Overwrite each seed's distance by position (dists[i] belongs to the i-th
+    // seeded entry), then restore sorted order and rewind the markers. The
+    // flag/visited bits travel with the entries through the sort, so reads
+    // already issued against the seeds stay accounted for.
+    void rescore_seeds(const float *dists) {
+      for (unsigned i = 0; i < cur_list_size_; ++i) {
+        retset_[i].distance = dists[i];
+      }
+      std::sort(retset_.begin(), retset_.begin() + cur_list_size_);
+      first_unvisited_ = 0;
+      send_marker_ = 0;
+    }
+
     // The frontier walks below rest on one invariant: a candidate's `flag` is
     // set only at insert() and cleared the instant its read is issued (async) or
     // it is handed out for expansion (sync). So a set flag implies the read has

@@ -106,7 +106,7 @@ namespace pipeann {
       pipeann::alloc_aligned((void **) &buf.aligned_dist_scratch, MAX_N_EDGES * sizeof(float), 256);
       pipeann::alloc_aligned((void **) &buf.aligned_query_, this->aligned_dim * sizeof(T), 8 * sizeof(T));
 
-      buf.visited = new tsl::robin_set<uint64_t>(4096);
+      buf.visited = new FlatVisitedSet(8192);
       buf.page_visited = new tsl::robin_set<unsigned>(4096);
 
       memset(buf.sector_scratch, 0, MAX_N_SECTOR_READS * io_size_dense);
@@ -403,6 +403,15 @@ namespace pipeann {
                     const std::vector<uint32_t> &neighbors);
 
     std::vector<uint32_t> get_to_lock_idx(uint32_t target, const std::vector<uint32_t> &neighbors);
+
+    // Single-id fast path of the vector form below, which pays a vector +
+    // sort + unique per call even for one id (the search path locks one id
+    // per IO).
+    inline void lock_idx(pipeann::SparseLockTable<uint64_t> &lock_table, uint32_t target, bool rd = false) {
+#ifndef READ_ONLY_TESTS
+      rd ? lock_table.rdlock(target) : lock_table.wrlock(target);
+#endif
+    }
 
     std::vector<uint32_t> lock_idx(pipeann::SparseLockTable<uint64_t> &lock_table, uint32_t target,
                                    const std::vector<uint32_t> &neighbors, bool rd = false);
