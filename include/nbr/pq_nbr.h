@@ -44,15 +44,8 @@ namespace pipeann {
       }
       pq_nbr_handler->pq_table = std::move(this->pq_table);
       pq_nbr_handler->npoints = new_npoints;
+      pq_nbr_handler->data_size = pq_nbr_handler->pq_table.n_chunks;
       return abs_nbr_handler;
-    }
-
-    // Expose the compressed-vector array for caller-side inline prefetch (see
-    // AbstractNeighbor::vec_prefetch_info). The pointer may go stale if a
-    // concurrent insert() resizes `data`, but a prefetch of a stale address is
-    // architecturally harmless and the real access still runs under pq_mu.
-    std::pair<const uint8_t *, uint64_t> vec_prefetch_info() const override {
-      return {data.data(), pq_table.n_chunks};
     }
 
     // For PQ, out-buffer is filled with PQ table distances.
@@ -93,13 +86,14 @@ namespace pipeann {
       LOG(INFO) << "PQ Pivots offset: " << pq_pivots_offset << " PQ Vectors offset: " << pq_vectors_offset;
 
       size_t npts_u64, nchunks_u64;
-      pipeann::load_bin<uint8_t>(pq_compressed_vectors, data, npts_u64, nchunks_u64, pq_vectors_offset);
+      pipeann::load_bin<uint8_t>(pq_compressed_vectors, this->data, npts_u64, nchunks_u64, pq_vectors_offset);
 
       LOG(INFO) << "Load compressed vectors from file: " << pq_compressed_vectors << " offset: " << pq_vectors_offset
                 << " num points: " << npts_u64 << " n_chunks: " << nchunks_u64;
 
       pq_table.load_pq_centroid_bin(pq_table_bin.c_str(), nchunks_u64, pq_pivots_offset);
       this->npoints = npts_u64;
+      this->data_size = pq_table.n_chunks;
     }
 
     void save(const char *index_prefix) {
@@ -158,6 +152,7 @@ namespace pipeann {
       uint64_t pq_offset = loc * pq_table.n_chunks;
       {
         pq_mu.lock();
+        this->data_size = pq_table.n_chunks;
         if (this->data.size() < pq_offset + pq_table.n_chunks) {
           this->data.resize(1.5 * (pq_offset + pq_table.n_chunks));
         }
@@ -168,20 +163,19 @@ namespace pipeann {
     }
 
     void clear() override {
-      data.clear();
-      data.shrink_to_fit();
+      this->data.clear();
+      this->data.shrink_to_fit();
       pq_table.destroy_table();
       this->npoints = 0;
+      this->data_size = 0;
     }
 
    private:
-    // PQ data
-    // pq_table.n_chunks = # of chunks ndims is split into
-    // data: uint8_t * pq_table.n_chunks
-    // chunk_size = chunk size of each dimension chunk
-    // pq_tables = float* [[2^8 * [chunk_size]] * pq_table.n_chunks]
+    // Compressed vectors live in AbstractNeighbor::data (uint8_t * pq_table.n_chunks);
+    // pq_table.n_chunks = # of chunks ndims is split into (== data_size stride),
+    // chunk_size = chunk size of each dimension chunk,
+    // pq_tables = float* [[2^8 * [chunk_size]] * pq_table.n_chunks].
     pipeann::ReaderOptSharedMutex pq_mu;
-    std::vector<uint8_t> data;
     FixedChunkPQTable<T> pq_table;
 
     // The gather below is one random DRAM access per id into the multi-GB

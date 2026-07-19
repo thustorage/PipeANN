@@ -126,18 +126,6 @@ namespace pipeann {
       return true;
     };
 
-    // Inline prefetch of the compressed vector compute_dists will gather for a
-    // just-collected id: issued during collection, the random DRAM access is
-    // long resolved by the time the distance kernel runs.
-    const auto [pq_vec_base, pq_vec_stride] = nbr_handler->vec_prefetch_info();
-    auto prefetch_pq_vec = [&](unsigned id) {
-      if (pq_vec_base != nullptr) {
-        const uint8_t *p = pq_vec_base + (uint64_t) id * pq_vec_stride;
-        pipeann::cpu_prefetch_t0(p);
-        pipeann::cpu_prefetch_t0(p + pq_vec_stride - 1);  // same line unless the entry straddles
-      }
-    };
-
     // --- Unified neighbor expansion (1-hop approx -> 2-hop approx -> 1-hop connectivity) ---
     uint64_t n_computes = 0;
     auto compute_and_push_nbrs = [&](DiskNode<T> &node) {
@@ -168,7 +156,7 @@ namespace pipeann {
         if (is_member_approx(node.nbrs[m])) {
           ++match;
           if (visited.insert(node.nbrs[m])) {
-            prefetch_pq_vec(node.nbrs[m]);
+            nbr_handler->prefetch(node.nbrs[m]);
             nbr_ids[nbors_cand_size++] = node.nbrs[m];
           }
         }
@@ -192,7 +180,7 @@ namespace pipeann {
           if (is_member_approx(node.dense_nbrs[m])) {
             ++match;
             if (visited.insert(node.dense_nbrs[m])) {
-              prefetch_pq_vec(node.dense_nbrs[m]);
+              nbr_handler->prefetch(node.dense_nbrs[m]);
               nbr_ids[nbors_cand_size++] = node.dense_nbrs[m];
             }
           }
@@ -201,7 +189,7 @@ namespace pipeann {
         // Remaining 1-hop neighbors for connectivity.
         for (unsigned m = 0; m < node.nnbrs && nbors_cand_size < node.nnbrs; ++m) {
           if (visited.insert(node.nbrs[m])) {
-            prefetch_pq_vec(node.nbrs[m]);
+            nbr_handler->prefetch(node.nbrs[m]);
             nbr_ids[nbors_cand_size++] = node.nbrs[m];
           }
         }

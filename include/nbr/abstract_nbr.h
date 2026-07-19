@@ -41,36 +41,56 @@ namespace pipeann {
     virtual std::string get_name() {
       return "AbstractNeighbor";
     }
+
     // rev_id_map: new_id -> old_id.
     virtual AbstractNeighbor<T> *shuffle(const libcuckoo::cuckoohash_map<uint32_t, uint32_t> &rev_id_map,
                                          uint64_t new_npoints, uint32_t nthreads) {
       return this;
     }
+
     virtual void initialize_query(const T *query, QueryBuffer *query_buf) {
     }
-    // (base, stride) of the compressed-vector array, for caller-side inline
-    // prefetch of the vector compute_dists() will gather for an id: the caller
-    // captures this once per query and issues cpu_prefetch_t0(base + id * stride)
-    // itself, avoiding a virtual call per neighbor.
-    virtual std::pair<const uint8_t *, uint64_t> vec_prefetch_info() const {
-      return {nullptr, 0};
+    
+    // Compressed-vector store owned here so the whole hierarchy shares one
+    // handle: PQ codes (uint8) or RaBitQ codes (bytes). data_size is the
+    // per-entry stride. The concrete handler fills `data` and sets `data_size`
+    // in load()/build(); prefetch(id) then warms the entry compute_dists() will
+    // gather. Non-virtual and inlined at the call site, so no per-neighbor dispatch.
+    std::vector<uint8_t> data;
+    uint64_t data_size = 0;
+
+    // Caller-side prefetch of the entry compute_dists() will gather for `id`:
+    // issued during neighbor collection, the random DRAM access is long resolved
+    // by the time the distance kernel runs. Reading data.data()/data_size while a
+    // concurrent insert() resizes `data` is architecturally harmless (a prefetch of
+    // a stale/invalid address just no-ops); the real access still runs under lock.
+    inline void prefetch(uint32_t id) const {
+      const uint8_t *p = data.data() + (uint64_t) id * data_size;
+      pipeann::cpu_prefetch_t0(p);
+      pipeann::cpu_prefetch_t0(p + data_size - 1);  // second line only if the entry straddles
     }
+
     // Compute dists using assymetric distance computation.
     virtual void compute_dists(QueryBuffer *query_buf, const uint32_t *ids, const uint64_t n_ids) {
     }
+
     // Compute dists using PQ all-to-all.
     virtual void compute_dists(const uint32_t query_id, const uint32_t *ids, const uint64_t n_ids, float *dists_out,
                                uint8_t *aligned_scratch) {
     }
+
     // Load the neighbor data (e.g., PQ) from disk.
     virtual void load(const char *index_prefix) {
     }
+
     // Save the neighbor data (e.g., PQ) to disk.
     virtual void save(const char *index_prefix) {
     }
+
     // Call load after build to load the neighbors.
     virtual void build(const std::string &index_prefix, const std::string &data_bin, uint32_t bytes_per_nbr) {
     }
+
     virtual void insert(T *point, uint32_t loc) {
     }
 

@@ -32,7 +32,9 @@ namespace pipeann {
     using pivot_id_t = uint8_t;
 
     uint64_t data_dim = 0, pad_dim = 0;
-    uint64_t bin_data_size = 0, ex_data_size = 0, data_size = 0;
+    // data_size (per-entry stride) lives in AbstractNeighbor so the base
+    // prefetch(id) can use it; only the bin/ex splits are RaBitQ-specific.
+    uint64_t bin_data_size = 0, ex_data_size = 0;
 
     enum { M_DELTA = 0, M_VL = 1, M_K1XSUMQ = 2, M_KBXSUMQ = 3 };  // offsets in query context.
 
@@ -40,8 +42,8 @@ namespace pipeann {
     rabitqlib::rotator_impl::FhtKacRotator *rotator_ = nullptr;
     float *rotated_pivots = nullptr;
 
-    // Each element: [pivot_id | bin_data]
-    std::vector<char> data;
+    // Each element: [pivot_id | bin_data], stored in AbstractNeighbor::data with
+    // ::data_size stride (set in load()/build()) so the base prefetch(id) works.
     Distance<float> *distance;
 
     rabitqlib::MetricType rabitq_metric = rabitqlib::MetricType::METRIC_L2;
@@ -147,9 +149,9 @@ namespace pipeann {
       for (uint64_t i = 0; i < n_ids; ++i) {
         if ((i + 1) < n_ids) {
           uint64_t next_id = ids[i + 1];
-          pipeann::prefetch_vector(data.data() + data_size * next_id, data_size);
+          pipeann::prefetch_vector((const char *) this->data.data() + this->data_size * next_id, this->data_size);
         }
-        char *item = data.data() + data_size * ids[i];
+        char *item = (char *) this->data.data() + this->data_size * ids[i];
 
         pivot_id_t pivot_id = 0;
         memcpy(&pivot_id, item, sizeof(pivot_id_t));
@@ -288,7 +290,7 @@ namespace pipeann {
       }
 
       // 3. Get cluster ID for each vector, and then quantize it.
-      data.resize(this->npoints * this->data_size);
+      this->data.resize(this->npoints * this->data_size);
       LOG(INFO) << "Quantizing " << this->npoints << " vectors...";
 
       // quantize vectors.
@@ -319,7 +321,8 @@ namespace pipeann {
         for (int64_t j = 0; j < (int64_t) cur_blk_size; j++) {
           uint32_t id = start_id + j;
           uint32_t cluster_id = closest_center[j];
-          quantize_single(block_data_float.get() + j * dim, cluster_id, this->data.data() + id * this->data_size);
+          quantize_single(block_data_float.get() + j * dim, cluster_id,
+                          (char *) this->data.data() + id * this->data_size);
         }
       }
 
@@ -333,13 +336,14 @@ namespace pipeann {
     }
 
     void clear() override {
-      data.clear();
-      data.shrink_to_fit();
+      this->data.clear();
+      this->data.shrink_to_fit();
       if (rotated_pivots != nullptr) {
         delete[] rotated_pivots;
         rotated_pivots = nullptr;
       }
       this->npoints = 0;
+      this->data_size = 0;
     }
 
    private:
