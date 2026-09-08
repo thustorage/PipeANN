@@ -11,12 +11,12 @@ class cached_ifstream {
  public:
   cached_ifstream() {
   }
-  cached_ifstream(const std::string &filename, uint64_t cacheSize, uint32_t initial_offset = 0)
+  cached_ifstream(const std::string &filename, uint64_t cacheSize, size_t initial_offset = 0)
       : cache_size(cacheSize), cur_off(0) {
     this->open(filename, cache_size, initial_offset);
   }
   ~cached_ifstream() {
-    //    delete[] cache_buf;
+    delete[] cache_buf;
     if (reader.is_open())
       reader.close();
   }
