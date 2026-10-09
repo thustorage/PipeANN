@@ -1,8 +1,10 @@
 #ifndef LOCK_TABLE_H_
 #define LOCK_TABLE_H_
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <omp.h>
 #include <shared_mutex>
 #include "utils/arch_compat.h"
@@ -24,21 +26,72 @@ inline void thread_pause() {
 }
 
 namespace pipeann {
+  // No thread ownership: page locks are acquired by insert threads and released by background IO.
+  // Waiting only polls the state until acquisition looks possible; there is no fairness guarantee.
+  class RWSpinLock {
+   public:
+    int tryrdlock() {
+      int state = state_.load(std::memory_order_relaxed);
+      while (state >= 0 && state < std::numeric_limits<int>::max()) {
+        if (state_.compare_exchange_weak(state, state + 1, std::memory_order_acquire,
+                                        std::memory_order_relaxed)) {
+          return 0;
+        }
+      }
+      return EBUSY;
+    }
+
+    int trywrlock() {
+      int state = state_.load(std::memory_order_relaxed);
+      return state == 0 && state_.compare_exchange_strong(state, -1, std::memory_order_acquire,
+                                                        std::memory_order_relaxed)
+                 ? 0
+                 : EBUSY;
+    }
+
+    void rdlock() {
+      while (tryrdlock() != 0) {
+        while (state_.load(std::memory_order_relaxed) == -1) {
+          thread_pause();
+        }
+      }
+    }
+
+    void wrlock() {
+      while (trywrlock() != 0) {
+        while (state_.load(std::memory_order_relaxed) != 0) {
+          thread_pause();
+        }
+      }
+    }
+
+    void unlock() {
+      if (state_.load(std::memory_order_relaxed) == -1) {
+        state_.store(0, std::memory_order_release);
+      } else {
+        state_.fetch_sub(1, std::memory_order_release);
+      }
+    }
+
+   private:
+    // 0: free, -1: write-held, positive: number of readers.
+    std::atomic<int> state_{0};
+  };
+
   template<class K, class HashFunction = std::hash<K>>
   class SparseLockTable {
    public:
     SparseLockTable() {
-      locks_ = new libcuckoo::cuckoohash_map<K, std::pair<pthread_rwlock_t *, int>, HashFunction>();
+      locks_ = new libcuckoo::cuckoohash_map<K, std::pair<RWSpinLock *, int>, HashFunction>();
     }
 
     int tryrdlock(const K &key) {
       int ret = 0;
-      locks_->upsert(key, [&](std::pair<pthread_rwlock_t *, int> &v, libcuckoo::UpsertContext ctx) {
+      locks_->upsert(key, [&](std::pair<RWSpinLock *, int> &v, libcuckoo::UpsertContext ctx) {
         if (ctx == libcuckoo::UpsertContext::NEWLY_INSERTED) {
-          v = std::make_pair(new pthread_rwlock_t, 0);
-          pthread_rwlock_init(v.first, nullptr);
+          v = std::make_pair(new RWSpinLock, 0);
         }
-        ret = pthread_rwlock_tryrdlock(v.first);
+        ret = v.first->tryrdlock();
         if (ret == 0) {
           v.second++;
         }
@@ -48,12 +101,11 @@ namespace pipeann {
 
     int trywrlock(const K &key) {
       int ret = 0;
-      locks_->upsert(key, [&](std::pair<pthread_rwlock_t *, int> &v, libcuckoo::UpsertContext ctx) {
+      locks_->upsert(key, [&](std::pair<RWSpinLock *, int> &v, libcuckoo::UpsertContext ctx) {
         if (ctx == libcuckoo::UpsertContext::NEWLY_INSERTED) {
-          v = std::make_pair(new pthread_rwlock_t, 0);
-          pthread_rwlock_init(v.first, nullptr);
+          v = std::make_pair(new RWSpinLock, 0);
         }
-        ret = pthread_rwlock_trywrlock(v.first);
+        ret = v.first->trywrlock();
         if (ret == 0) {
           v.second++;
         }
@@ -62,27 +114,22 @@ namespace pipeann {
     }
 
     void rdlock(const K &key) {
-      while (tryrdlock(key) != 0) {
-        thread_pause();
-      }
+      lock(key, false);
     }
 
     void wrlock(const K &key) {
-      while (trywrlock(key) != 0) {
-        thread_pause();
-      }
+      lock(key, true);
     }
 
     inline void unlock(const K &key) {
-      locks_->erase_fn(key, [&](std::pair<pthread_rwlock_t *, int> &v) {
+      locks_->erase_fn(key, [&](std::pair<RWSpinLock *, int> &v) {
         if (v.second == 0) {
           LOG(ERROR) << "SparseLockTable: unlock a non-locked key: " << key;
           __builtin_trap();
         }
-        pthread_rwlock_unlock(v.first);
+        v.first->unlock();
 
         if (v.second == 1) {
-          pthread_rwlock_destroy(v.first);
           delete v.first;
         }
         v.second--;
@@ -95,7 +142,23 @@ namespace pipeann {
     }
 
    private:
-    libcuckoo::cuckoohash_map<K, std::pair<pthread_rwlock_t *, int>, HashFunction> *locks_;
+    void lock(const K &key, bool write) {
+      RWSpinLock *rwlock = nullptr;
+      locks_->upsert(key, [&](std::pair<RWSpinLock *, int> &v, libcuckoo::UpsertContext ctx) {
+        if (ctx == libcuckoo::UpsertContext::NEWLY_INSERTED) {
+          v = std::make_pair(new RWSpinLock, 0);
+        }
+        // Pin the lock before leaving the map, including while waiting to acquire it.
+        ++v.second;
+        rwlock = v.first;
+      });
+
+      // Never block under the bucket lock: unlock() needs that same bucket.
+      write ? rwlock->wrlock() : rwlock->rdlock();
+    }
+
+    // The count includes both holders and waiters; all updates are protected by the map.
+    libcuckoo::cuckoohash_map<K, std::pair<RWSpinLock *, int>, HashFunction> *locks_;
   };
 
   template<class K, class HashFunction = std::hash<K>>
