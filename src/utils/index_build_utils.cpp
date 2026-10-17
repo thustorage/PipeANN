@@ -16,6 +16,7 @@
 #include "filter/attribute.h"
 #include "utils/cached_io.h"
 #include "index.h"
+#include "nbr/rabitq_nbr.h"
 #include "ssd_index.h"
 #include "ssd_index_defs.h"
 #include "omp.h"
@@ -24,39 +25,61 @@
 
 namespace pipeann {
   template<typename T>
-  void normalize_data_file(const std::string &inFileName, const std::string &outFileName) {
-    std::ifstream readr(inFileName, std::ios::binary);
-    std::ofstream writr(outFileName, std::ios::binary);
+  std::string prepare_build_vectors(const std::string &filename, Metric metric, VectorType node_type) {
+    size_t n, dim;
+    get_bin_metadata(filename, n, dim);
+    if (!n || !dim || std::filesystem::file_size(filename) != 8 + n * dim * sizeof(T))
+      throw std::invalid_argument("RAW vector file shape/size mismatch: " + filename);
+    if (node_type != VectorType::RAW && node_type != VectorType::RABITQ8)
+      throw std::invalid_argument("Build nodes must be RAW or RaBitQ8");
 
-    int npts_s32, ndims_s32;
-    readr.read((char *) &npts_s32, sizeof(int32_t));
-    readr.read((char *) &ndims_s32, sizeof(int32_t));
-
-    writr.write((char *) &npts_s32, sizeof(int32_t));
-    writr.write((char *) &ndims_s32, sizeof(int32_t));
-
-    uint64_t npts = (uint64_t) npts_s32, ndims = (uint64_t) ndims_s32;
-    LOG(INFO) << "Normalizing vectors in file: " << inFileName;
-    LOG(INFO) << "Dataset: #pts = " << npts << ", # dims = " << ndims;
-
-    uint64_t blk_size = 131072;
-    uint64_t nblks = ROUND_UP(npts, blk_size) / blk_size;
-    LOG(INFO) << "# blks: " << nblks;
-
-    T *read_buf = new T[blk_size * ndims];
-    for (uint64_t i = 0; i < nblks; i++) {
-      uint64_t cblk_size = std::min(npts - i * blk_size, blk_size);
-      readr.read((char *) read_buf, cblk_size * ndims * sizeof(T));
-#pragma omp parallel for schedule(static, 4096)
-      for (uint64_t j = 0; j < cblk_size; j++) {
-        normalize_data(read_buf + j * ndims, read_buf + j * ndims, ndims);
+    const std::string &prefix = filename;
+    // Re-preparing RAW replaces any previous RBQ representation at this prefix.
+    if (node_type == VectorType::RAW)
+      for (const char *suffix : RABITQ_METADATA_SUFFIXES)
+        std::filesystem::remove(prefix + suffix);
+    std::string input = filename;
+    if (metric == COSINE) {
+      input = prefix + (node_type == VectorType::RAW ? "_processed.bin" : "_normalized.tmp.bin");
+      LOG(INFO) << "Streaming normalization to " << input;
+      std::ifstream in(filename, std::ios::binary);
+      in.seekg(8);
+      std::ofstream out(input, std::ios::binary);
+      const uint32_t header[] = {static_cast<uint32_t>(n), static_cast<uint32_t>(dim)};
+      out.write(reinterpret_cast<const char *>(header), sizeof(header));
+      const size_t block_size = std::min<size_t>(4096, n);
+      std::vector<T> block(block_size * dim);
+      for (size_t begin = 0; begin < n; begin += block_size) {
+        const size_t rows = std::min(block_size, n - begin);
+        in.read(reinterpret_cast<char *>(block.data()), rows * dim * sizeof(T));
+        if (!in) throw std::runtime_error("Cannot read build input vectors");
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < rows; ++i)
+          normalize_data(block.data() + i * dim, block.data() + i * dim, dim);
+        out.write(reinterpret_cast<const char *>(block.data()), rows * dim * sizeof(T));
       }
-      writr.write((char *) read_buf, cblk_size * ndims * sizeof(T));
+      out.close();
+      if (!out) throw std::runtime_error("Cannot write normalized vectors");
     }
-    delete[] read_buf;
+    if (node_type == VectorType::RAW) return input;
 
-    LOG(INFO) << "Wrote normalized points to file: " << outFileName;
+    auto codec = std::make_unique<RaBitQNeighbor<T, 8>>(metric);
+    codec->training_centers = 1;
+    codec->build(prefix, input, 8);
+    if (input != filename) std::remove(input.c_str());
+    return prefix + "_processed.bin";
   }
+
+  void remove_prepared_vectors(const std::string &filename, const std::string &prepared, VectorType node_type) {
+    if (prepared != filename) std::filesystem::remove(prepared);
+    if (node_type == VectorType::RABITQ8)
+      for (const char *suffix : RABITQ_METADATA_SUFFIXES)
+        std::filesystem::remove(filename + suffix);
+  }
+
+  template std::string prepare_build_vectors<float>(const std::string &, Metric, VectorType);
+  template std::string prepare_build_vectors<int8_t>(const std::string &, Metric, VectorType);
+  template std::string prepare_build_vectors<uint8_t>(const std::string &, Metric, VectorType);
 
   /***************************************************
       Support for Merging Many Vamana Indices
@@ -126,10 +149,14 @@ namespace pipeann {
     ndims = readers[0].meta.data_dim;
 
     const uint64_t attr_size = attr_writer ? attr_writer->attr_size() : 0;
-    const uint64_t max_node_len = ((uint64_t) R_dense + 1) * sizeof(uint32_t) + ndims * sizeof(T) + attr_size;
+    const uint64_t vec_bytes = readers[0].meta.vector_bytes();
+    for (const auto &r : readers)
+      if (r.meta.vector_bytes() != vec_bytes || r.meta.vector_type != readers[0].meta.vector_type)
+        throw std::runtime_error("Incompatible shard vector encodings");
+    const uint64_t max_node_len = ((uint64_t) R_dense + 1) * sizeof(uint32_t) + vec_bytes + attr_size;
     const uint64_t nnodes_per_sector = SECTOR_LEN / max_node_len;
-    SSDIndexMetadata<T> out_meta(nnodes, ndims, idmaps[0][readers[0].meta.entry_point], max_node_len,
-                                 nnodes_per_sector, R, attr_size, R_ood);
+    SSDIndexMetadata<T> out_meta(nnodes, ndims, idmaps[0][readers[0].meta.entry_point], max_node_len, nnodes_per_sector,
+                                 R, attr_size, R_ood, readers[0].meta.vector_type);
     out_meta.print();
 
     const uint64_t bytes_per_write = nnodes_per_sector > 0 ? SECTOR_LEN : ROUND_UP(max_node_len, SECTOR_LEN);
@@ -144,15 +171,15 @@ namespace pipeann {
     std::random_device rng;
     std::mt19937 urng(rng());
 
-    enum {ONE_HOP, OOD, DENSE, NHOOD_TYPE_CNT};
+    enum { ONE_HOP, OOD, DENSE, NHOOD_TYPE_CNT };
     // Per-node dedup sets keyed by global id; only hold the current node's neighbors
     // (a few hundred entries), so they stay cache-resident even at billion scale.
     tsl::robin_set<unsigned> nhood_set[NHOOD_TYPE_CNT];
     std::vector<unsigned> nhood[NHOOD_TYPE_CNT];
-    
+
     std::vector<unsigned> final_nhood;
     final_nhood.reserve(R_dense);
-    std::vector<T> coord_buf(ndims, 0);
+    std::vector<uint8_t> coord_buf(vec_bytes, 0);
 
     uint64_t cur_sector_start = 0;
 
@@ -165,7 +192,7 @@ namespace pipeann {
       }
 
       DiskNode<T> node(sector_buf.data(), (uint32_t) global_id, out_meta);
-      memcpy(node.coords, coord_buf.data(), ndims * sizeof(T));
+      memcpy(node.coords, coord_buf.data(), vec_bytes);
 
       for (auto &nhood_vec : nhood) {
         std::shuffle(nhood_vec.begin(), nhood_vec.end(), urng);
@@ -187,7 +214,8 @@ namespace pipeann {
       size_t n_ood_nbrs = 0;
       for (size_t i = 0; i < nhood[OOD].size() && n_ood_nbrs < R_ood && n_ood_nbrs < nnbrs; i++) {
         unsigned nbr = nhood[OOD][i];
-        if (nhood_set[ONE_HOP].count(nbr) || nhood_set[DENSE].count(nbr)) continue;
+        if (nhood_set[ONE_HOP].count(nbr) || nhood_set[DENSE].count(nbr))
+          continue;
         final_nhood[nnbrs - 1 - n_ood_nbrs] = nbr;  // reverse order into tail R_ood slots.
         n_ood_nbrs++;
       }
@@ -226,22 +254,22 @@ namespace pipeann {
       // loc == cur_in_buf so DiskNode picks position (cur_in_buf % nnodes_per_sector) in the sector.
       DiskNode<T> shard_node(r.buf.data(), r.cur_in_buf, r.meta);
       r.cur_in_buf++;
-      memcpy(coord_buf.data(), shard_node.coords, ndims * sizeof(T));
+      memcpy(coord_buf.data(), shard_node.coords, vec_bytes);
 
       for (uint16_t j = 0; j < shard_node.nnbrs; j++) {
         const unsigned renamed = idmaps[shard][shard_node.nbrs[j]];
-        if (j < shard_node.nnbrs - shard_R_ood) { // base nbr.
+        if (j < shard_node.nnbrs - shard_R_ood) {  // base nbr.
           if (nhood_set[ONE_HOP].insert(renamed).second) {
             nhood[ONE_HOP].push_back(renamed);
           }
-        } else { // OOD nbr.
+        } else {  // OOD nbr.
           if (nhood_set[OOD].insert(renamed).second) {
             nhood[OOD].push_back(renamed);
           }
         }
       }
 
-      for (uint16_t j = 0; j < shard_node.n_dense_nbrs; j++) { // dense nbr.
+      for (uint16_t j = 0; j < shard_node.n_dense_nbrs; j++) {  // dense nbr.
         const unsigned renamed = idmaps[shard][shard_node.dense_nbrs[j]];
         if (nhood_set[DENSE].insert(renamed).second) {
           nhood[DENSE].push_back(renamed);
@@ -263,77 +291,90 @@ namespace pipeann {
       pipeann::save_bin<TagT>(output_disk_file + ".tags", identical_tags.data(), nnodes, 1);
     }
 
+    // Records retain their shard encoding; publish the matching shared codec.
+    if (out_meta.vector_type == VectorType::RABITQ8)
+      for (const char *suffix : RABITQ_METADATA_SUFFIXES)
+        std::filesystem::copy_file(shard_prefix + "0" + shard_suffix + suffix, output_disk_file + suffix,
+                                   std::filesystem::copy_options::overwrite_existing);
     out_meta.save_to_disk_index(output_disk_file);
     LOG(INFO) << "merge_shards: wrote " << output_disk_file;
     return 0;
   }
 
   template<typename T, typename TagT>
-  int build_merged_index(std::string base_file, pipeann::Metric _compareMetric, uint16_t R, uint32_t L_or_L1,
-                         double sampling_rate, double ram_budget, std::string disk_index_path, const char *tag_file,
+  int build_merged_index(const std::string &base_file, pipeann::Metric _compareMetric, uint16_t R, uint32_t L_or_L1,
+                         double ram_budget, std::string disk_index_path, const char *tag_file,
                          uint16_t R_dense, uint32_t num_threads, uint32_t L2, const std::string &train_query_path,
-                         uint16_t R_ood, uint32_t L_ood, AttrWriter *attr_writer) {
+                         uint16_t R_ood, uint32_t L_ood, AttrWriter *attr_writer, VectorType node_type) {
     size_t base_num, base_dim;
     pipeann::get_bin_metadata(base_file, base_num, base_dim);
+    if (!base_num || !base_dim || !std::isfinite(ram_budget) || ram_budget <= 0 ||
+        std::filesystem::file_size(base_file) != 8 + base_num * base_dim * sizeof(T))
+      throw std::invalid_argument("Invalid build input or RAM budget");
+    if (node_type != VectorType::RAW && node_type != VectorType::RABITQ8)
+      throw std::invalid_argument("Build nodes must be RAW or RaBitQ8");
 
-    double full_index_ram = estimate_ram_usage(base_num, base_dim, sizeof(T), R);
+    const bool encoded = node_type == VectorType::RABITQ8;
+    const size_t record_bytes = encoded ? RaBitQQuantizer<T, 8>::vector_size(base_dim) : base_dim * sizeof(T);
+    const double full_index_ram = estimate_ram_usage(base_num, record_bytes, 1, R);
+    if (L2 != 0 && full_index_ram >= ram_budget * 1024 * 1024 * 1024)
+      throw std::invalid_argument("PiPNN requires the full index to fit in RAM");
+
+    const auto graph_input = prepare_build_vectors<T>(base_file, _compareMetric, node_type);
     if (full_index_ram < ram_budget * 1024 * 1024 * 1024) {
       LOG(INFO) << "Full index fits in RAM, building in one shot";
       pipeann::IndexBuildParameters paras;
-
       paras.use_pipnn = (L2 != 0);
-      paras.set(R, L_or_L1, 750, 1.2, num_threads, true);                // only used by Vamana.
-      paras.pipnn_set(2048, 256, 0.01f, 1000, L_or_L1, L2, 2, 12, 128);  // only used by PiPNN.
+      paras.set(R, L_or_L1, 750, 1.2, num_threads, true);
+      paras.pipnn_set(2048, 256, 0.01f, 1000, L_or_L1, L2, 2, 128);
 
-      auto _pvamanaIndex = std::make_unique<pipeann::Index<T, TagT>>(_compareMetric, base_dim);
-      _pvamanaIndex->build(base_file.c_str(), base_num, paras, tag_file, false, train_query_path, R_ood, L_ood);
-      SSDIndex<T, TagT>::save_from_mem(*_pvamanaIndex, disk_index_path, R_dense, attr_writer);
+      Index<T, TagT> index(load_neighbor<T>(graph_input, _compareMetric));
+      index.build(paras, tag_file, train_query_path, R_ood, L_ood);
+      SSDIndex<T, TagT>::save_from_mem(index, disk_index_path, R_dense, attr_writer);
+      remove_prepared_vectors(base_file, graph_input, node_type);
       return 0;
     }
 
-    if (L2 != 0) {
-      LOG(ERROR) << "PiPNN requires the full index to fit in RAM. Estimated RAM usage: "
-                 << full_index_ram / (1024 * 1024 * 1024) << "GB, budget given is " << ram_budget << "GB";
-      exit(-1);
-    }
+    constexpr size_t kMaxPartitionSamples = 256000;
+    const double sample_p = std::min(1.0, double(kMaxPartitionSamples) / base_num);
+    const std::string merged_index_prefix = disk_index_path + "_tempFiles";
+    const int num_parts = partition_with_ram_budget<T>(graph_input, sample_p, ram_budget, 2 * R / 3,
+                                                       merged_index_prefix, 2, _compareMetric);
+    remove_prepared_vectors(base_file, graph_input, node_type);
 
-    std::string merged_index_prefix = disk_index_path + "_tempFiles";
-    int num_parts =
-        partition_with_ram_budget<T>(base_file, sampling_rate, ram_budget, 2 * R / 3, merged_index_prefix, 2);
-
-    // Keep shard/final R_ood proportions consistent (shard_R = 2*R/3, so shard_R_ood = 2*R_ood/3).
     const uint16_t shard_R_ood = (uint16_t) (2 * (uint32_t) R_ood / 3);
     const uint16_t shard_R_dense = (uint16_t) (2 * (uint32_t) R_dense / 3);
     for (int p = 0; p < num_parts; p++) {
-      std::string shard_base_file = merged_index_prefix + "_subshard-" + std::to_string(p) + ".bin";
-      std::string shard_disk_file = merged_index_prefix + "_subshard-" + std::to_string(p) + "_disk.index";
-
+      const std::string shard_prefix = merged_index_prefix + "_subshard-" + std::to_string(p);
+      const std::string shard_raw_file = shard_prefix + "_data.bin";
+      const std::string shard_disk_file = shard_prefix + "_disk.index";
+      const auto shard_input = encoded ? shard_raw_file + "_processed.bin" : shard_raw_file;
       pipeann::IndexBuildParameters paras;
       paras.set(2 * R / 3, L_or_L1, 750, 1.2, num_threads, false);
-      uint64_t shard_base_dim, shard_base_pts;
-      get_bin_metadata(shard_base_file, shard_base_pts, shard_base_dim);
-      auto _pvamanaIndex = std::make_unique<pipeann::Index<T, TagT>>(_compareMetric, shard_base_dim);
-      _pvamanaIndex->build(shard_base_file.c_str(), shard_base_pts, paras, (const char *) nullptr, false,
-                           train_query_path, shard_R_ood, L_ood);
-      SSDIndex<T, TagT>::save_from_mem(*_pvamanaIndex, shard_disk_file, shard_R_dense);
+      Index<T, TagT> index(load_neighbor<T>(shard_input, _compareMetric));
+      index.build(paras, (const char *) nullptr, train_query_path, shard_R_ood, L_ood);
+      SSDIndex<T, TagT>::save_from_mem(index, shard_disk_file, shard_R_dense);
+      remove_prepared_vectors(shard_raw_file, shard_input, node_type);
+      std::remove(shard_raw_file.c_str());
     }
 
     pipeann::merge_shards<T, TagT>(merged_index_prefix + "_subshard-", "_disk.index",
                                    merged_index_prefix + "_subshard-", "_ids_uint32.bin", num_parts, R, R_dense, R_ood,
                                    disk_index_path, tag_file ? std::string(tag_file) : std::string(""), attr_writer);
 
-    // Cleanup shard artifacts.
     for (int p = 0; p < num_parts; p++) {
-      std::string shard_base_file = merged_index_prefix + "_subshard-" + std::to_string(p) + ".bin";
-      std::string shard_id_file = merged_index_prefix + "_subshard-" + std::to_string(p) + "_ids_uint32.bin";
-      std::string shard_disk_file = merged_index_prefix + "_subshard-" + std::to_string(p) + "_disk.index";
-      std::string shard_disk_tags = shard_disk_file + ".tags";
-
-      std::remove(shard_base_file.c_str());
-      std::remove(shard_id_file.c_str());
+      const std::string shard_prefix = merged_index_prefix + "_subshard-" + std::to_string(p);
+      const std::string shard_disk_file = shard_prefix + "_disk.index";
+      std::remove((shard_prefix + "_ids_uint32.bin").c_str());
       std::remove(shard_disk_file.c_str());
-      std::remove(shard_disk_tags.c_str());
+      std::remove((shard_disk_file + ".tags").c_str());
+      if (encoded) {
+        for (const char *suffix : RABITQ_METADATA_SUFFIXES) {
+          std::remove((shard_disk_file + suffix).c_str());
+        }
+      }
     }
+    std::remove((merged_index_prefix + "_centroids.bin").c_str());
     return 0;
   }
 
@@ -342,7 +383,7 @@ namespace pipeann {
                         uint32_t num_threads, uint32_t bytes_per_nbr, pipeann::Metric _compareMetric,
                         const char *tag_file, AbstractNeighbor<T> *nbr_handler, AttrWriter *attr_writer,
                         uint16_t R_dense, uint32_t L2, const std::string &train_query_path, uint16_t R_ood,
-                        uint32_t L_ood) {
+                        uint32_t L_ood, VectorType node_type) {
     std::string dataFilePath(dataPath);
     std::string index_prefix_path(indexFilePath);
     std::string disk_index_path = index_prefix_path + "_disk.index";
@@ -359,29 +400,19 @@ namespace pipeann {
                 << " Build RAM budget: " << M << "GB T: " << num_threads << " bytes per neighbor: " << bytes_per_nbr;
     }
 
-    std::string normalized_file_path = dataFilePath;
-    if (_compareMetric == pipeann::Metric::COSINE) {
-      normalized_file_path = std::string(indexFilePath) + "_data.normalized.bin";
-      normalize_data_file<T>(dataFilePath, normalized_file_path);
-    }
-
     auto s = std::chrono::high_resolution_clock::now();
-    nbr_handler->build(index_prefix_path, normalized_file_path, bytes_per_nbr);
+    const auto neighbor_input = prepare_build_vectors<T>(dataFilePath, _compareMetric, VectorType::RAW);
+    nbr_handler->build(index_prefix_path, neighbor_input, bytes_per_nbr);
+    remove_prepared_vectors(dataFilePath, neighbor_input, VectorType::RAW);
 
     auto start = std::chrono::high_resolution_clock::now();
-    auto p_val = nbr_handler->get_sample_p();
-    nbr_handler->clear(); // free compressed vectors; object stays alive for later load().
-    pipeann::build_merged_index<T, TagT>(normalized_file_path, _compareMetric, R, L_or_L1, p_val, M, disk_index_path,
+    nbr_handler->clear();  // free compressed neighbor codes during graph construction.
+    pipeann::build_merged_index<T, TagT>(dataFilePath, _compareMetric, R, L_or_L1, M, disk_index_path,
                                          tag_file, R_dense, num_threads, L2, train_query_path, R_ood, L_ood,
-                                         attr_writer);
+                                         attr_writer, node_type);
     auto end = std::chrono::high_resolution_clock::now();
     LOG(INFO) << (L2 == 0 ? "Vamana" : "PiPNN")
               << " index built in: " << std::chrono::duration<double>(end - start).count() << "s.";
-
-    if (normalized_file_path != dataFilePath) {
-      LOG(INFO) << "Deleting normalized vector file: " << normalized_file_path;
-      std::remove(normalized_file_path.c_str());
-    }
 
     auto e = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = e - s;
@@ -394,39 +425,41 @@ namespace pipeann {
                                                    pipeann::Metric _compareMetric, const char *tag_file,
                                                    AbstractNeighbor<int8_t> *nbr_handler, AttrWriter *label,
                                                    uint16_t R_dense, uint32_t L2, const std::string &train_query_path,
-                                                   uint16_t R_ood, uint32_t L_ood);
+                                                   uint16_t R_ood, uint32_t L_ood, VectorType node_type);
   template bool build_disk_index<uint8_t, uint32_t>(const char *dataPath, const char *indexFilePath, uint16_t R,
                                                     uint32_t L, uint32_t M, uint32_t num_threads,
                                                     uint32_t bytes_per_nbr, pipeann::Metric _compareMetric,
                                                     const char *tag_file, AbstractNeighbor<uint8_t> *nbr_handler,
                                                     AttrWriter *label, uint16_t R_dense, uint32_t L2,
-                                                    const std::string &train_query_path, uint16_t R_ood,
-                                                    uint32_t L_ood);
+                                                    const std::string &train_query_path, uint16_t R_ood, uint32_t L_ood,
+                                                    VectorType node_type);
   template bool build_disk_index<float, uint32_t>(const char *dataPath, const char *indexFilePath, uint16_t R,
                                                   uint32_t L, uint32_t M, uint32_t num_threads, uint32_t bytes_per_nbr,
                                                   pipeann::Metric _compareMetric, const char *tag_file,
                                                   AbstractNeighbor<float> *nbr_handler, AttrWriter *label,
                                                   uint16_t R_dense, uint32_t L2, const std::string &train_query_path,
-                                                  uint16_t R_ood, uint32_t L_ood);
+                                                  uint16_t R_ood, uint32_t L_ood, VectorType node_type);
 
-  template int build_merged_index<int8_t, uint32_t>(std::string base_file, pipeann::Metric _compareMetric, uint16_t R,
-                                                    uint32_t L_or_L1, double sampling_rate, double ram_budget,
-                                                    std::string disk_index_path, const char *tag_file, uint16_t R_dense,
-                                                    uint32_t num_threads, uint32_t L2,
-                                                    const std::string &train_query_path, uint16_t R_ood, uint32_t L_ood,
-                                                    AttrWriter *attr_writer);
-  template int build_merged_index<float, uint32_t>(std::string base_file, pipeann::Metric _compareMetric, uint16_t R,
-                                                   uint32_t L_or_L1, double sampling_rate, double ram_budget,
-                                                   std::string disk_index_path, const char *tag_file, uint16_t R_dense,
-                                                   uint32_t num_threads, uint32_t L2,
+  template int build_merged_index<int8_t, uint32_t>(const std::string &base_file, pipeann::Metric _compareMetric,
+                                                    uint16_t R, uint32_t L_or_L1,
+                                                    double ram_budget, std::string disk_index_path,
+                                                    const char *tag_file, uint16_t R_dense, uint32_t num_threads,
+                                                    uint32_t L2, const std::string &train_query_path, uint16_t R_ood,
+                                                    uint32_t L_ood, AttrWriter *attr_writer,
+                                                    VectorType node_type);
+  template int build_merged_index<float, uint32_t>(const std::string &base_file, pipeann::Metric _compareMetric,
+                                                   uint16_t R, uint32_t L_or_L1,
+                                                   double ram_budget, std::string disk_index_path, const char *tag_file,
+                                                   uint16_t R_dense, uint32_t num_threads, uint32_t L2,
                                                    const std::string &train_query_path, uint16_t R_ood, uint32_t L_ood,
-                                                   AttrWriter *attr_writer);
-  template int build_merged_index<uint8_t, uint32_t>(std::string base_file, pipeann::Metric _compareMetric, uint16_t R,
-                                                     uint32_t L_or_L1, double sampling_rate, double ram_budget,
-                                                     std::string disk_index_path, const char *tag_file,
-                                                     uint16_t R_dense, uint32_t num_threads, uint32_t L2,
-                                                     const std::string &train_query_path, uint16_t R_ood,
-                                                     uint32_t L_ood, AttrWriter *attr_writer);
+                                                   AttrWriter *attr_writer, VectorType node_type);
+  template int build_merged_index<uint8_t, uint32_t>(const std::string &base_file, pipeann::Metric _compareMetric,
+                                                     uint16_t R, uint32_t L_or_L1,
+                                                     double ram_budget, std::string disk_index_path,
+                                                     const char *tag_file, uint16_t R_dense, uint32_t num_threads,
+                                                     uint32_t L2, const std::string &train_query_path, uint16_t R_ood,
+                                                     uint32_t L_ood, AttrWriter *attr_writer,
+                                                     VectorType node_type);
 
   template int merge_shards<int8_t, uint32_t>(const std::string &shard_prefix, const std::string &shard_suffix,
                                               const std::string &idmaps_prefix, const std::string &idmaps_suffix,

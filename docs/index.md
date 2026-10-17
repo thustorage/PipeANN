@@ -145,6 +145,7 @@ Milvus-vs-PipeANN benchmarks.
 
 ## 📰 Updates
 
+- **Oct 17, 2026**: [RaBitQ8 on-disk vectors](cpp-interface.md#rabitq8-on-disk-vectors) supported; recommended for high-dimensional float vectors (512+ dimensions) for faster search and smaller SSD indexes with little recall loss
 - **May 18, 2026**: SPDK backend supported, stable tail latency with better multi-SSD scalability
 - **May 18, 2026**: Filtered Search (Speculative Filtering), OOD search ([NGFix](https://dl.acm.org/doi/abs/10.1145/3769783)) & range search supported
 - **May 18, 2026**: PipeANN is integrated into OdinANN (search + insert), higher performance with less threads
@@ -200,4 +201,3 @@ If you use PipeANN in your research, please cite our papers:
 
 PipeANN is based on [DiskANN and FreshDiskANN](https://github.com/microsoft/DiskANN/tree/diskv2).
 We sincerely appreciate their excellent work.
-

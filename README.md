@@ -143,6 +143,7 @@ See [Application Integrations](docs/application-integrations.md) for the Milvus-
 
 ## 📰 Updates
 
+- **Oct 17, 2026**: [RaBitQ8 on-disk vectors](docs/cpp-interface.md#rabitq8-on-disk-vectors) supported; recommended for high-dimensional float vectors (512+ dimensions) for faster search and smaller SSD indexes with little recall loss
 - **May 26, 2026**: Filter config unified around SQL-like expressions with `$$var` placeholders for batch binding; legacy selector-config loader removed
 - **May 18, 2026**: SPDK backend supported, stable tail latency with better multi-SSD scalability
 - **May 18, 2026**: Filtered Search (Speculative Filtering), OOD search ([NGFix](https://dl.acm.org/doi/abs/10.1145/3769783)) & range search supported

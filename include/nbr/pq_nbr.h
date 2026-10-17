@@ -3,6 +3,7 @@
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "utils.h"
 #include "nbr/pq_table.h"
+#include "distance.h"
 #include "ssd_index_defs.h"
 #include "nbr/abstract_nbr.h"
 #include "utils/partition.h"
@@ -17,7 +18,14 @@ namespace pipeann {
     static constexpr uint32_t NUM_KMEANS = 15;
 
    public:
-    PQNeighbor(pipeann::Metric metric) : AbstractNeighbor<T>(metric), pq_table(metric) {
+    PQNeighbor(pipeann::Metric metric) : AbstractNeighbor<T>(metric), distance(metric) {
+    }
+
+    uint64_t dim() const override {
+      return distance.table.ndims;
+    }
+    void initialize_query(const T *query, void *out) override {
+      distance.initialize_query(query, out, distance.table.ndims);
     }
 
     // max size of context needed for a single query.
@@ -25,7 +33,7 @@ namespace pipeann {
       return 256 * AbstractNeighbor<T>::MAX_BYTES_PER_NBR * sizeof(float);
     }
 
-    std::string get_name() {
+    std::string get_name() const {
       return "PQNeighbor";
     }
 
@@ -36,72 +44,58 @@ namespace pipeann {
       PQNeighbor<T> *pq_nbr_handler = new PQNeighbor<T>(this->metric);
       abs_nbr_handler = pq_nbr_handler;
 
-      pq_nbr_handler->data.resize(new_npoints * this->pq_table.n_chunks);
+      pq_nbr_handler->data_.resize(new_npoints * this->distance.table.n_chunks);
 #pragma omp parallel for num_threads(nthreads)
       for (uint64_t i = 0; i < new_npoints; ++i) {
-        memcpy(pq_nbr_handler->data.data() + i * this->pq_table.n_chunks,
-               this->data.data() + rev_id_map.find(i) * this->pq_table.n_chunks, this->pq_table.n_chunks);
+        memcpy(pq_nbr_handler->data_.data() + i * this->distance.table.n_chunks,
+               this->data_.data() + rev_id_map.find(i) * this->distance.table.n_chunks, this->distance.table.n_chunks);
       }
-      pq_nbr_handler->pq_table = std::move(this->pq_table);
+      pq_nbr_handler->distance.table = std::move(this->distance.table);
       pq_nbr_handler->npoints = new_npoints;
-      pq_nbr_handler->data_size = pq_nbr_handler->pq_table.n_chunks;
+      pq_nbr_handler->data_size = pq_nbr_handler->distance.table.n_chunks;
       return abs_nbr_handler;
     }
 
-    // For PQ, out-buffer is filled with PQ table distances.
-    void initialize_query(const T *query, QueryBuffer *query_buf) {
-      return pq_table.populate_chunk_distances(query, query_buf->nbr_ctx_scratch);
+    void encode(const T *point, void *out) override {
+      distance.encode(point, out, distance.table.ndims);
+    }
+    void decode(const void *record, T *out) const override {
+      distance.decode(record, out, distance.table.ndims);
+    }
+    void compute_dists_sym(const uint8_t *record, const uint32_t *ids, size_t n, float *out) override {
+      std::shared_lock<pipeann::ReaderOptSharedMutex> lock(pq_mu);
+      distance.bulk_compare_sym(record, this->data(), ids, n, out, distance.table.ndims, this->data_size);
     }
 
-    // call initialize_query first!
-    // output to query_buf->aligned_dist_scratch
-    void compute_dists(QueryBuffer *query_buf, const uint32_t *ids, const uint64_t n_ids) {
-      pq_mu.lock_shared();
-      aggregate_coords(ids, n_ids, this->data.data(), pq_table.n_chunks, query_buf->nbr_vec_scratch);
-      pq_dist_lookup(query_buf->nbr_vec_scratch, n_ids, pq_table.n_chunks, query_buf->nbr_ctx_scratch,
-                     query_buf->aligned_dist_scratch);
-      pq_mu.unlock_shared();
+    void compute_dists(uint32_t query_id, const uint32_t *ids, size_t n_ids, float *dists_out) override {
+      std::shared_lock<pipeann::ReaderOptSharedMutex> lock(pq_mu);
+      const uint8_t *src_ptr = this->data_.data() + (distance.table.n_chunks * query_id);
+      distance.bulk_compare_sym(src_ptr, this->data(), ids, n_ids, dists_out, distance.table.ndims, this->data_size);
     }
 
-    void compute_dists(const uint32_t query_id, const uint32_t *ids, const uint64_t n_ids, float *dists_out,
-                       uint8_t *aligned_scratch) {
-      pq_mu.lock_shared();
-      const uint8_t *src_ptr = this->data.data() + (pq_table.n_chunks * query_id);
-      // aggregate PQ coords into scratch
-      aggregate_coords(ids, n_ids, this->data.data(), pq_table.n_chunks, aligned_scratch);
-      // compute distances
-      this->pq_table.compute_distances_alltoall(src_ptr, aligned_scratch, dists_out, n_ids);
-      pq_mu.unlock_shared();
+    void compute_dists(const void *query, const uint32_t *ids, size_t n, float *out) override {
+      std::shared_lock<pipeann::ReaderOptSharedMutex> lock(pq_mu);
+      distance.bulk_compare(query, this->data(), ids, n, out, distance.table.ndims, this->data_size);
     }
-
-    void load(const char *index_prefix) {
-      // TODO(gh): possible memory leak for centroid bin during reload.
-      std::string iprefix = std::string(index_prefix);
-      std::string pq_table_bin = iprefix + "_pq_pivots.bin";
-      std::string pq_compressed_vectors = iprefix + "_pq_compressed.bin";
-
-      size_t pq_pivots_offset = 0;
-      size_t pq_vectors_offset = 0;
-
-      LOG(INFO) << "PQ Pivots offset: " << pq_pivots_offset << " PQ Vectors offset: " << pq_vectors_offset;
-
-      size_t npts_u64, nchunks_u64;
-      pipeann::load_bin<uint8_t>(pq_compressed_vectors, this->data, npts_u64, nchunks_u64, pq_vectors_offset);
-
-      LOG(INFO) << "Load compressed vectors from file: " << pq_compressed_vectors << " offset: " << pq_vectors_offset
-                << " num points: " << npts_u64 << " n_chunks: " << nchunks_u64;
-
-      pq_table.load_pq_centroid_bin(pq_table_bin.c_str(), nchunks_u64, pq_pivots_offset);
-      this->npoints = npts_u64;
-      this->data_size = pq_table.n_chunks;
+    void load_metadata(const char *index_prefix) override {
+      distance.load_metadata(index_prefix);
+      this->data_size = distance.table.n_chunks;
     }
-
-    void save(const char *index_prefix) {
-      // write PQ pivots.
-      std::string pq_out = std::string(index_prefix) + "_pq_compressed.bin";
-      std::string pq_pivot_out = std::string(index_prefix) + "_pq_pivots.bin";
-      pipeann::save_bin<uint8_t>(pq_out, this->data.data(), this->npoints, pq_table.n_chunks);
-      pq_table.save_pq_pivots(pq_pivot_out.c_str());
+    void save_metadata(const char *index_prefix) override {
+      distance.save_metadata(index_prefix);
+    }
+    void load(const char *index_prefix) override {
+      load_metadata(index_prefix);
+      size_t n, chunks;
+      pipeann::load_bin(std::string(index_prefix) + "_pq_compressed.bin", this->data_, n, chunks);
+      if (chunks != this->data_size)
+        throw std::runtime_error("PQ code size mismatch");
+      this->npoints = n;
+    }
+    void save(const char *index_prefix) override {
+      save_metadata(index_prefix);
+      pipeann::save_bin(std::string(index_prefix) + "_pq_compressed.bin", this->data_.data(), this->npoints,
+                        this->data_size);
     }
 
     // During build, we use L2 for both L2 and MIPS.
@@ -120,10 +114,14 @@ namespace pipeann {
       LOG(INFO) << "Using " << num_pq_chunks << " PQ chunks.";
 
       size_t train_size, train_dim;
-      float *train_data;  // maximum: 256000 * dim * data_size, 1GB for 1024-dim float vector.
+      float *train_data;  // maximum: 256000 * dim * sizeof(float), 1GB for 1024-dim float vector.
 
       auto start = std::chrono::high_resolution_clock::now();
-      double p_val = this->get_sample_p();
+      if (!points_num || !dim)
+        throw std::invalid_argument("PQ requires nonempty vectors");
+      constexpr size_t kMaxTrainingSamples = 256000;
+      const size_t sample_count = std::min(kMaxTrainingSamples, std::max<size_t>(1, std::lround(0.1 * points_num)));
+      const double p_val = double(sample_count) / points_num;
       // generates random sample and sets it to train_data and updates train_size
       gen_random_slice<T>(data_bin, p_val, train_data, train_size, train_dim);
 
@@ -141,139 +139,36 @@ namespace pipeann {
       LOG(INFO) << "Compressed data written in: " << std::chrono::duration<double>(end - start).count() << "s.";
     }
 
-    void insert(T *point, uint32_t loc) {
-      std::vector<uint8_t> pq_coords(pq_table.n_chunks);
-      std::vector<float> fp_vec(pq_table.ndims);
-      for (uint32_t i = 0; i < pq_table.ndims; i++) {
-        fp_vec[i] = (float) point[i];
-      }
-      pq_table.deflate_vec(fp_vec.data(), pq_coords.data());
+    void insert(const T *point, uint32_t loc) {
+      std::vector<uint8_t> pq_coords(distance.table.n_chunks);
+      distance.encode(point, pq_coords.data(), distance.table.ndims);
 
-      uint64_t pq_offset = loc * pq_table.n_chunks;
+      uint64_t pq_offset = loc * distance.table.n_chunks;
       {
         pq_mu.lock();
-        this->data_size = pq_table.n_chunks;
-        if (this->data.size() < pq_offset + pq_table.n_chunks) {
-          this->data.resize(1.5 * (pq_offset + pq_table.n_chunks));
+        this->data_size = distance.table.n_chunks;
+        if (this->data_.size() < pq_offset + distance.table.n_chunks) {
+          this->data_.resize(1.5 * (pq_offset + distance.table.n_chunks));
         }
-        memcpy(this->data.data() + pq_offset, pq_coords.data(), pq_table.n_chunks);
+        memcpy(this->data_.data() + pq_offset, pq_coords.data(), distance.table.n_chunks);
         this->npoints = std::max(this->npoints, (uint64_t) (loc + 1));
         pq_mu.unlock();
       }
     }
 
     void clear() override {
-      this->data.clear();
-      this->data.shrink_to_fit();
-      pq_table.destroy_table();
-      this->npoints = 0;
+      AbstractNeighbor<T>::clear();
+      distance.table.destroy_table();
       this->data_size = 0;
     }
 
    private:
-    // Compressed vectors live in AbstractNeighbor::data (uint8_t * pq_table.n_chunks);
-    // pq_table.n_chunks = # of chunks ndims is split into (== data_size stride),
+    // Compressed vectors live in AbstractNeighbor::data (uint8_t * distance.table.n_chunks);
+    // distance.table.n_chunks = # of chunks ndims is split into (== data_size in bytes),
     // chunk_size = chunk size of each dimension chunk,
-    // pq_tables = float* [[2^8 * [chunk_size]] * pq_table.n_chunks].
+    // pq_tables = float* [[2^8 * [chunk_size]] * distance.table.n_chunks].
     pipeann::ReaderOptSharedMutex pq_mu;
-    FixedChunkPQTable<T> pq_table;
-
-    // The gather below is one random DRAM access per id into the multi-GB
-    // compressed array; without prefetch each iteration stalls on the miss.
-    // Prefetch kAggPrefetchDist ids ahead (both cachelines an entry can span)
-    // to overlap the misses.
-    static constexpr uint64_t kAggPrefetchDist = 8;
-
-    template<uint64_t kFixedDims>
-    inline void aggregate_coords_fixed(const unsigned *ids, const uint64_t n_ids, const uint8_t *all_coords,
-                                       uint8_t *out) {
-      for (uint64_t i = 0; i < n_ids; i++) {
-        if (i + kAggPrefetchDist < n_ids) {
-          pipeann::cpu_prefetch_t0(all_coords + ids[i + kAggPrefetchDist] * kFixedDims);
-        }
-        // Constant size: inlines to vector loads/stores instead of a libc
-        // memmove call per id.
-        memcpy(out + i * kFixedDims, all_coords + ids[i] * kFixedDims, kFixedDims);
-      }
-    }
-
-    inline void aggregate_coords(const unsigned *ids, const uint64_t n_ids, const uint8_t *all_coords,
-                                 const uint64_t ndims, uint8_t *out) {
-      for (uint64_t i = 0; i < n_ids && i < kAggPrefetchDist; i++) {
-        pipeann::cpu_prefetch_t0(all_coords + ids[i] * ndims);
-      }
-      switch (ndims) {
-        case 16:
-          return aggregate_coords_fixed<16>(ids, n_ids, all_coords, out);
-        case 32:
-          return aggregate_coords_fixed<32>(ids, n_ids, all_coords, out);
-        case 64:
-          return aggregate_coords_fixed<64>(ids, n_ids, all_coords, out);
-        case 128:
-          return aggregate_coords_fixed<128>(ids, n_ids, all_coords, out);
-        default:
-          break;
-      }
-      for (uint64_t i = 0; i < n_ids; i++) {
-        if (i + kAggPrefetchDist < n_ids) {
-          pipeann::cpu_prefetch_t0(all_coords + ids[i + kAggPrefetchDist] * ndims);
-        }
-        memcpy(out + i * ndims, all_coords + ids[i] * ndims, ndims * sizeof(uint8_t));
-      }
-    }
-
-    inline void prefetch_chunk_dists(const float *ptr) {
-      pipeann::cpu_prefetch_nta((char *) ptr);
-      pipeann::cpu_prefetch_nta((char *) (ptr + 64));
-      pipeann::cpu_prefetch_nta((char *) (ptr + 128));
-      pipeann::cpu_prefetch_nta((char *) (ptr + 192));
-    }
-
-    // Point-major, 8-point-blocked table accumulation. The distance table
-    // (n_chunks KB) is L1/L2-resident and each point's codes stream
-    // sequentially, so the binding constraint is load-port throughput: keeping
-    // the 8 accumulators in registers does 2 loads per (point, chunk) versus
-    // 3 loads + 1 store for the classic chunk-major loop (~2x). Per point the
-    // chunks are still accumulated in increasing order, so results are
-    // bit-identical to the chunk-major form.
-    inline void pq_dist_lookup(const uint8_t *pq_ids, const uint64_t n_pts, const uint64_t pq_nchunks,
-                               const float *pq_dists, float *dists_out) {
-      pipeann::cpu_prefetch_t0((char *) pq_ids);
-      prefetch_chunk_dists(pq_dists);
-
-      uint64_t i = 0;
-      for (; i + 8 <= n_pts; i += 8) {
-        const uint8_t *c = pq_ids + i * pq_nchunks;
-        float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
-        for (uint64_t chunk = 0; chunk < pq_nchunks; chunk++) {
-          const float *cd = pq_dists + 256 * chunk;
-          a0 += cd[c[chunk]];
-          a1 += cd[c[pq_nchunks + chunk]];
-          a2 += cd[c[2 * pq_nchunks + chunk]];
-          a3 += cd[c[3 * pq_nchunks + chunk]];
-          a4 += cd[c[4 * pq_nchunks + chunk]];
-          a5 += cd[c[5 * pq_nchunks + chunk]];
-          a6 += cd[c[6 * pq_nchunks + chunk]];
-          a7 += cd[c[7 * pq_nchunks + chunk]];
-        }
-        dists_out[i + 0] = a0;
-        dists_out[i + 1] = a1;
-        dists_out[i + 2] = a2;
-        dists_out[i + 3] = a3;
-        dists_out[i + 4] = a4;
-        dists_out[i + 5] = a5;
-        dists_out[i + 6] = a6;
-        dists_out[i + 7] = a7;
-      }
-      for (; i < n_pts; i++) {
-        const uint8_t *c = pq_ids + i * pq_nchunks;
-        float a = 0;
-        for (uint64_t chunk = 0; chunk < pq_nchunks; chunk++) {
-          a += pq_dists[256 * chunk + c[chunk]];
-        }
-        dists_out[i] = a;
-      }
-    }
+    DistancePQ<T> distance;
 
     // given training data in train_data of dimensions num_train * dim, generate PQ
     // pivots using k-means algorithm to partition the co-ordinates into
@@ -436,7 +331,7 @@ namespace pipeann {
         return -1;
       }
 
-      this->pq_table.load_pq_centroid_bin(pq_pivots_path.c_str(), num_pq_chunks, 0);
+      this->distance.table.load_pq_centroid_bin(pq_pivots_path.c_str(), num_pq_chunks, 0);
 
       size_t num_points, dim;
       pipeann::get_bin_metadata(data_file, num_points, dim, offset);
@@ -472,14 +367,14 @@ namespace pipeann {
 #pragma omp parallel for schedule(static, 512)
         for (uint64_t p = 0; p < cur_blk_size; p++) {
           for (uint64_t d = 0; d < dim; d++) {
-            block_data_float[p * dim + d] -= pq_table.centroid[d];
+            block_data_float[p * dim + d] -= distance.table.centroid[d];
           }
         }
 
         // Parallelize over PQ chunks - each chunk is independent
 #pragma omp parallel for schedule(static, 1)
         for (size_t i = 0; i < num_pq_chunks; i++) {
-          size_t cur_chunk_size = pq_table.chunk_offsets[i + 1] - pq_table.chunk_offsets[i];
+          size_t cur_chunk_size = distance.table.chunk_offsets[i + 1] - distance.table.chunk_offsets[i];
           if (cur_chunk_size == 0)
             continue;
 
@@ -490,13 +385,15 @@ namespace pipeann {
           // Extract chunk data from block
           for (int64_t j = 0; j < (int64_t) cur_blk_size; j++) {
             std::memcpy(cur_data.get() + j * cur_chunk_size,
-                        block_data_float.get() + j * dim + pq_table.chunk_offsets[i], cur_chunk_size * sizeof(float));
+                        block_data_float.get() + j * dim + distance.table.chunk_offsets[i],
+                        cur_chunk_size * sizeof(float));
           }
 
           // Extract chunk pivots
           for (int64_t j = 0; j < (int64_t) num_centers; j++) {
             std::memcpy(cur_pivot_data.get() + j * cur_chunk_size,
-                        pq_table.tables + j * dim + pq_table.chunk_offsets[i], cur_chunk_size * sizeof(float));
+                        distance.table.tables + j * dim + distance.table.chunk_offsets[i],
+                        cur_chunk_size * sizeof(float));
           }
 
           // Compute closest centers for this chunk

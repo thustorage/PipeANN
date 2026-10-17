@@ -12,6 +12,8 @@
 #include "utils/lock_table.h"
 
 #include "distance.h"
+#include "nbr/abstract_nbr.h"
+#include <memory>
 #include "utils.h"
 #include "utils/pipnn.h"
 
@@ -28,24 +30,24 @@ namespace pipeann {
   template<typename T, typename TagT = uint32_t>
   class Index {
    public:
-    // Constructor. The index will be dynamically resized.
-    Index(Metric m, const size_t dim, uint64_t max_points = 0);
-    Index(Metric m, const SSDIndexMetadata<T> &meta);
+    // Adopt loaded or empty vector storage. Neighbor defines the metric and
+    // dimension; max_points optionally reserves capacity for future insertions.
+    explicit Index(std::unique_ptr<AbstractNeighbor<T>> vectors, uint64_t max_points = 0);
+    // Restore graph state with prepared vector storage; the caller handles file I/O.
+    Index(const SSDIndexMetadata<T> &meta, std::unique_ptr<AbstractNeighbor<T>> vectors);
 
     ~Index();
 
     size_t get_num_points();
 
-    // For cosine metric, if data is not pre-normalized, normalize_cosine should be set to true.
-    // For SSD index, data is pre-normalized for correct PQ initialization, so normalize_cosine should be set to false.
-    // R_ood = NGFix refine out-degree (total degree stays params.R = R_base + R_ood).
-    // If R_ood > 0 and train_query_path is non-empty, run NGFix refine after the base Vamana build.
-    void build(const char *filename, const size_t num_points_to_load, IndexBuildParameters &params,
-               const std::vector<TagT> &tags, bool normalize_cosine = true, const std::string &train_query_path = "",
+    // Connect the records supplied at construction; vector I/O is caller-owned.
+    // R_ood = NGFix refine out-degree; run refine when a training query path is supplied.
+    void build(IndexBuildParameters &params,
+               const std::vector<TagT> &tags, const std::string &train_query_path = "",
                uint32_t R_ood = 0, uint32_t L_ood = 1500);
-    void build(const char *filename, const size_t num_points_to_load, IndexBuildParameters &params,
-               const char *tag_filename = nullptr, bool normalize_cosine = true,
-               const std::string &train_query_path = "", uint32_t R_ood = 0, uint32_t L_ood = 1500);
+    void build(IndexBuildParameters &params,
+               const char *tag_filename = nullptr, const std::string &train_query_path = "",
+               uint32_t R_ood = 0, uint32_t L_ood = 1500);
 
     // Added search overload that takes L as params, so that we
     // can customize L on a per-query basis without tampering with "IndexBuildParameters"
@@ -67,21 +69,18 @@ namespace pipeann {
     // not found, 0 if OK.
     int lazy_delete(const TagT &tag);
 
-    // return immediately after "approx" converge.
-    uint32_t search_with_tags_fast(const T *normalized_query, const unsigned L, TagT *tags, float *dists);
-
     void consolidate(IndexBuildParameters &params);
 
     /*  Internals of the library */
     std::vector<std::vector<unsigned>> _final_graph;  // 1-hop neighbors.
 
-    // determines navigating node of the graph by calculating medoid of data
+    // Select a random existing node as the graph entry point.
     unsigned calculate_entry_point();
 
-    std::pair<uint32_t, uint32_t> iterate_to_fixed_point(const T *node_coords, const unsigned Lindex,
-                                                         const std::vector<unsigned> &init_ids,
+    // Both query and nodes use stored records: RAW vectors or RaBitQ8 codes.
+    std::pair<uint32_t, uint32_t> iterate_to_fixed_point(const uint8_t *query, const unsigned Lindex,
+                                                         const unsigned ep,
                                                          std::vector<Neighbor> &expanded_nodes_info,
-                                                         tsl::robin_set<unsigned> &expanded_nodes_ids,
                                                          std::vector<Neighbor> &best_L_nodes,
                                                          QueryStats *stats = nullptr);
 
@@ -109,7 +108,7 @@ namespace pipeann {
     void resize(size_t new_max_points);
 
     size_t max_points() const {
-      return _data.size() / _dim;
+      return _vectors->size();
     }
 
     // Use SSDIndex::save_from_mem and load_to_mem for saving/loading an in-memory index.
@@ -121,12 +120,12 @@ namespace pipeann {
     // (tag == loc) for the first _nd locations if the file does not exist.
     void load_tags(const std::string &tags_file);
 
-    std::vector<T> _data;
-    Distance<T> *_distance = nullptr;
+    // Owns both representation parameters and contiguous records.
+    std::unique_ptr<AbstractNeighbor<T>> _vectors;
     pipeann::Metric _dist_metric;
 
     size_t _dim;
-    size_t _nd = 0;       // number of active points i.e. existing in the graph
+    size_t _nd = 0;       // occupied prefix, including lazy-deleted points until consolidation
     uint16_t range = 0;   // maximum 1-hop out-degree (R_total = R_base + R_ood).
     uint16_t R_base = 0;  // Base build out-degree (e.g., Vamana or PiPNN), set during build().
     uint16_t R_ood = 0;   // NGFix refine out-degree, set during build().
@@ -137,7 +136,6 @@ namespace pipeann {
     std::unordered_map<unsigned, TagT> _location_to_tag;
 
     tsl::robin_set<unsigned> _delete_set;
-    tsl::robin_set<unsigned> _empty_slots;
 
     // NGFix refine build-only sidecars. Cleared after build().
     // _ngfix_count[u] = number of refine edges currently in _final_graph[u][R_base..R_base+R_ood).
@@ -155,12 +153,19 @@ namespace pipeann {
     const float INDEX_GROWTH_FACTOR = 1.5f;
 
    private:
+    // Normalize and encode a raw vector for search, refinement or insertion.
+    std::vector<uint8_t> prepare_record(const T *query);
+    // Caller holds _update_lock so the record store stays stable across reuse.
+    std::pair<uint32_t, uint32_t> search_prepared(const uint8_t *query, unsigned L,
+                                                std::vector<Neighbor> &results, QueryStats *stats = nullptr,
+                                                const std::vector<uint32_t> *cand_ids = nullptr);
+
     // NGFix refine: query-driven OOD edge augmentation.
     // After base build (R_base edges saturated), appends up to R_ood refine edges per node
     // at positions [R_base, R). Sidecars _ngfix_count/_ngfix_ehs are build-only.
     void ngfix_calc_hardness(const unsigned *gt, size_t Nq, size_t S, std::vector<std::vector<uint16_t>> &H);
-    void ngfix_pass(const T *query, const unsigned *gt, size_t Nq, size_t Kh);
-    void rfix_pass(const T *query, const unsigned *gt, size_t Nq, uint32_t L_ood);
+    void ngfix_pass(const unsigned *gt, size_t Nq, size_t Kh);
+    void rfix_pass(const uint8_t *prepared_query, const unsigned *gt, size_t Nq, uint32_t L_ood);
     void add_ngfix_neighbor(unsigned u, unsigned v, uint16_t eh);
   };
 }  // namespace pipeann

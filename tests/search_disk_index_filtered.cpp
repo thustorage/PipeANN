@@ -62,7 +62,7 @@ int search_disk_index(int argc, char **argv) {
 
   // Initialize index
   std::shared_ptr<AlignedFileReader> reader(new LinuxAlignedFileReader());
-  pipeann::AbstractNeighbor<T> *nbr_handler = pipeann::get_nbr_handler<T>(m, nbr_type);
+  pipeann::AbstractNeighbor<T> *nbr_handler = pipeann::create_neighbor<T>(m, nbr_type);
   pipeann::IndexBuildParameters idx_params;
   idx_params.max_nthreads = num_threads; // limit the number of allocated buffers.
   std::unique_ptr<pipeann::SSDIndex<T>> _pFlashIndex(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "utils.h"
+#include "nbr/rabitq_quantizer.h"
 #include "utils/tsl/robin_set.h"
 #include "utils/visited_set.h"
 
@@ -35,6 +36,12 @@ struct IORequest {
 };
 
 namespace pipeann {
+  // Shared vector representation for build inputs and on-disk node payloads.
+  enum class VectorType : uint64_t {
+    RAW = 0,
+    RABITQ8 = 1
+  };
+
   template<typename T, typename IdT = uint32_t>
   struct SSDIndexMetadata {
     // The order matches that on SSD.
@@ -49,6 +56,16 @@ namespace pipeann {
     uint64_t max_npts = 0;  // capacity.
     uint64_t range = 0;     // maximum out-degree. For densified graph, range << range_dense (typically).
     uint64_t R_ood = 0;     // NGFix refine out-degree. Last R_ood positions of nnbrs are refine edges.
+    VectorType vector_type = VectorType::RAW;
+
+    uint64_t vector_bytes() const {
+      switch (vector_type) {
+        case VectorType::RAW: return data_dim * sizeof(T);
+        case VectorType::RABITQ8: return RaBitQQuantizer<T, 8>::vector_size(data_dim);
+      }
+      LOG(ERROR) << "Unknown disk vector type";
+      exit(-1);
+    }
 
     /* temporary fields (currently not stored on disk). */
     uint64_t normal_node_len = 0;  // normal node length (do not read dense_nbrs).
@@ -64,16 +81,22 @@ namespace pipeann {
     SSDIndexMetadata() = default;
 
     SSDIndexMetadata(uint64_t npoints, uint64_t data_dim, uint64_t entry_point, uint64_t max_node_len,
-                     uint64_t nnodes_per_sector, uint64_t range, uint64_t attr_size, uint64_t R_ood)
+                     uint64_t nnodes_per_sector, uint64_t range, uint64_t attr_size, uint64_t R_ood,
+                     VectorType vector_type = VectorType::RAW)
         : npoints(npoints), data_dim(data_dim), entry_point(entry_point), max_node_len(max_node_len),
           nnodes_per_sector(nnodes_per_sector), npts_cur_shard(npoints), attr_size(attr_size), range(range),
-          R_ood(R_ood), data_type(UNDEFINED) {
+          R_ood(R_ood), vector_type(vector_type), data_type(UNDEFINED) {
       this->init_temporary_fields();
     }
 
     void init_temporary_fields() {
+      if (vector_bytes() > max_node_len || attr_size > max_node_len - vector_bytes() ||
+          max_node_len - vector_bytes() - attr_size < sizeof(unsigned)) {
+        LOG(ERROR) << "Node payload exceeds disk record size";
+        exit(-1);
+      }
       this->max_npts = npoints;
-      this->range_dense = (max_node_len - data_dim * sizeof(T) - attr_size) / sizeof(unsigned) - 1;
+      this->range_dense = (max_node_len - vector_bytes() - attr_size) / sizeof(unsigned) - 1;
 
       // Backward compatible: range is not stored on disk.
       if (this->range == 0 || this->range >= this->range_dense) {
@@ -117,7 +140,7 @@ namespace pipeann {
       return loc * max_node_len;
     }
     inline uint64_t u_loc_offset_nbr(uint64_t loc) const {
-      return loc * max_node_len + data_dim * sizeof(T);
+      return loc * max_node_len + vector_bytes();
     }
 
     void print() const {
@@ -160,6 +183,17 @@ namespace pipeann {
         this->R_ood = 0;
       }
 
+      if (nr >= 10) {
+        in.read(reinterpret_cast<char *>(&vector_type), sizeof(vector_type));
+      } else {
+        vector_type = VectorType::RAW;
+      }
+
+      if (!in || (vector_type != VectorType::RAW && vector_type != VectorType::RABITQ8)) {
+        LOG(ERROR) << "Invalid disk vector type";
+        exit(-1);
+      }
+
       if (!sharded) {
         this->npts_cur_shard = this->npoints;
       }
@@ -184,7 +218,7 @@ namespace pipeann {
       out.write(buf.data(), buf.size());
       out.seekp(0, std::ios::beg);
 
-      nr = 9;  // hard-coded for the number of uint64_t below.
+      nr = 10;  // hard-coded for the number of uint64_t below.
       nc = 1;
       out.write((char *) &nr, sizeof(uint32_t));
       out.write((char *) &nc, sizeof(uint32_t));
@@ -199,6 +233,7 @@ namespace pipeann {
       out.write((char *) &attr_size, sizeof(uint64_t));
       out.write((char *) &range, sizeof(uint64_t));
       out.write((char *) &R_ood, sizeof(uint64_t));
+      out.write((char *) &vector_type, sizeof(uint64_t));
     }
   };
 
@@ -221,26 +256,23 @@ namespace pipeann {
     DiskNode(char *page_buf, uint32_t loc, const SSDIndexMetadata<T> &meta)
         : coords((T *) (page_buf +
                         (meta.nnodes_per_sector == 0 ? 0 : (loc % meta.nnodes_per_sector) * meta.max_node_len))),
-          nnbrs(*(uint16_t *) ((char *) coords + meta.data_dim * sizeof(T))),
-          n_dense_nbrs(*(uint16_t *) ((char *) coords + meta.data_dim * sizeof(T) + sizeof(uint16_t))),
-          nbrs((uint32_t *) ((char *) coords + meta.data_dim * sizeof(T) + sizeof(uint32_t))),
-          attrs((void *) ((char *) coords + meta.data_dim * sizeof(T) + (1 + meta.range) * sizeof(uint32_t))),
-          dense_nbrs((uint32_t *) ((char *) coords + meta.data_dim * sizeof(T) + (1 + meta.range) * sizeof(uint32_t) +
+          nnbrs(*(uint16_t *) ((char *) coords + meta.vector_bytes())),
+          n_dense_nbrs(*(uint16_t *) ((char *) coords + meta.vector_bytes() + sizeof(uint16_t))),
+          nbrs((uint32_t *) ((char *) coords + meta.vector_bytes() + sizeof(uint32_t))),
+          attrs((void *) ((char *) coords + meta.vector_bytes() + (1 + meta.range) * sizeof(uint32_t))),
+          dense_nbrs((uint32_t *) ((char *) coords + meta.vector_bytes() + (1 + meta.range) * sizeof(uint32_t) +
                                    meta.attr_size)) {
     }
   };
 
   struct QueryBuffer {
-    uint8_t *coord_scratch_ = nullptr;  // MUST BE AT LEAST [aligned_dim * sizeof(T)], for current vector in comparison.
-
     char *sector_scratch = nullptr;  // MUST BE AT LEAST [MAX_N_SECTOR_READS * SECTOR_LEN], for sectors.
     uint64_t sector_idx = 0;         // index of next [SECTOR_LEN] scratch to use
 
     uint32_t *nbr_id_scratch = nullptr;     // MUST BE AT LEAST [MAX_N_EDGES], for nbr IDs (used in filter search).
     float *nbr_ctx_scratch = nullptr;       // MUST BE AT LEAST [256 * NCHUNKS], for pq table distance.
     float *aligned_dist_scratch = nullptr;  // MUST BE AT LEAST pipeann MAX_DEGREE, for exact dist.
-    uint8_t *nbr_vec_scratch = nullptr;     // MUST BE AT LEAST  [N_CHUNKS * MAX_DEGREE], for neighbor PQ vectors.
-    uint8_t *aligned_query_ = nullptr;      // MUST BE AT LEAST [aligned_dim * sizeof(T)], for aligned query.
+    uint8_t *aligned_query_ = nullptr;      // RAW query, replaced by a node-format code for encoded disk nodes.
     char *update_buf = nullptr;             // Dynamic allocate in insert_in_place.
 
     // Prefetchable visited set (see visited_set.h): insert-only, the probe
@@ -249,11 +281,6 @@ namespace pipeann {
     FlatVisitedSet *visited = nullptr;
     tsl::robin_set<unsigned> *page_visited = nullptr;
     IORequest reqs[MAX_N_SECTOR_READS];
-
-    template<typename T>
-    T *coord_scratch() {
-      return (T *) coord_scratch_;
-    }
 
     template<typename T>
     T *aligned_query() {

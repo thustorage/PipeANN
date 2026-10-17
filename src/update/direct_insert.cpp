@@ -37,16 +37,21 @@ namespace pipeann {
     nbr_handler->insert(point, target_id);
 
     std::vector<Neighbor> exp_node_info;
-    InsertContext insert_ctx(kExpandedNodesFactor * this->params.L, this->aligned_dim);
+    InsertContext insert_ctx(kExpandedNodesFactor * this->params.L, meta_.vector_bytes());
     this->do_pipe_search(point1, params.L, 0, params.L, params.beam_width, exp_node_info, nullptr, &insert_ctx);
     std::vector<uint32_t> new_nhood;
 
     // SPACEV1B frequently chooses entry_point as a neighbor, which causes contention.
     auto params_copy = params; // < 100 bytes, copy should be fast.
     params_copy.R += 1;
-    pipeann::prune_neighbors(exp_node_info, new_nhood, params_copy, metric, [this, &insert_ctx](uint32_t a, uint32_t b) {
-      return this->dist_cmp->compare(insert_ctx.coord_map[a], insert_ctx.coord_map[b], this->meta_.data_dim);
-    });
+    pipeann::prune_neighbors(exp_node_info, new_nhood, params_copy, metric,
+        [this, &insert_ctx](uint32_t a, const uint32_t *ids, size_t n, float *out) {
+          std::vector<uint32_t> positions(n);
+          for (size_t i = 0; i < n; ++i) positions[i] = insert_ctx.coord_map.at(ids[i]);
+          const auto *source = insert_ctx.coord_buf + size_t(insert_ctx.coord_map.at(a)) * meta_.vector_bytes();
+          node_distance_->bulk_compare_sym(source, insert_ctx.coord_buf, positions.data(), n, out,
+                                              meta_.data_dim, meta_.vector_bytes());
+        });
 
     // Produce one more neighbor, and remove entry_point in the final results.
     // Only points close enough to the entry point can connect to it.
@@ -145,7 +150,7 @@ namespace pipeann {
     // update the target node.
     auto sector = loc_sector_no(locs[new_nhood.size()]);
     DiskNode<T> target_node = node_from_page(page_buf_map[sector], locs[new_nhood.size()]);
-    memcpy(target_node.coords, point, meta_.data_dim * sizeof(T));
+    node_distance_->encode(point, target_node.coords, meta_.data_dim);
     target_node.nnbrs = new_nhood.size();
     memcpy(target_node.nbrs, new_nhood.data(), new_nhood.size() * sizeof(uint32_t));
     tags.insert_or_assign(target_id, tag);
@@ -196,12 +201,11 @@ namespace pipeann {
       nhood.emplace_back(target_id);  // attention: we do not reuse IDs.
 
       if (nhood.size() > this->params.R) {  // delta prune neighbors
-        auto &thread_pq_buf = read_data->nbr_vec_scratch;
         auto nbr = this->nbr_handler;
         pipeann::delta_prune_neighbors(
             nhood, new_nhood[i], target_id, params, metric,
-            [nbr, &thread_pq_buf](uint32_t center, const uint32_t *ids, uint32_t n, float *dists_out) {
-              nbr->compute_dists(center, ids, n, dists_out, thread_pq_buf);
+            [nbr](uint32_t center, const uint32_t *ids, uint32_t n, float *dists_out) {
+              nbr->compute_dists(center, ids, n, dists_out);
             });
       }
 

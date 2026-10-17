@@ -156,13 +156,14 @@ namespace pipeann {
     }
 
     compute_timer.reset();
-    nbr_handler->initialize_query(query, query_buf);
+    initialize_query(query, query_buf);
     std::priority_queue<Neighbor> pq;
     // compare PQ distance with all the vectors in vector_id_set. MAX_N_EDGES at a time.
     std::vector<uint32_t> vector_ids(vector_id_set.begin(), vector_id_set.end());
     for (size_t i = 0; i < vector_ids.size(); i += MAX_N_EDGES) {
       uint32_t n_ids = std::min(MAX_N_EDGES, vector_ids.size() - i);
-      nbr_handler->compute_dists(query_buf, vector_ids.data() + i, n_ids);
+      nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, vector_ids.data() + i, n_ids,
+                                 query_buf->aligned_dist_scratch);
       for (uint32_t j = 0; j < n_ids; ++j) {
         if (pq.size() >= l_search && query_buf->aligned_dist_scratch[j] < pq.top().distance) {
           pq.pop();
@@ -223,11 +224,13 @@ namespace pipeann {
           stats->n_filter_accessed_vectors[PRE_FILTER]++;
           stats->n_filter_false_positives[PRE_FILTER] += !is_member;
         }
-        retset[i - N_READS + j].distance = is_member ? dist_cmp->compare(query, node.coords, (unsigned) aligned_dim)
-                                                     : std::numeric_limits<float>::max();
+        retset[i - N_READS + j].distance =
+            is_member ? node_distance_->compare_sym(query_buf->aligned_query_, node.coords, meta_.data_dim)
+                      : std::numeric_limits<float>::max();
         if (is_member && node_out != nullptr) {
           NodePayload payload;
-          payload.coords.assign(node.coords, node.coords + meta_.data_dim);
+          payload.coords.resize(meta_.data_dim);
+          node_distance_->decode(node.coords, payload.coords.data(), meta_.data_dim);
           if (meta_.attr_size > 0) payload.attrs = std::move(target_attrs);
           node_out->insert(std::make_pair(id2tag(retset[i - N_READS + j].id), std::move(payload)));
         }

@@ -22,6 +22,16 @@
 #include "utils/tsl/robin_set.h"
 
 namespace pipeann {
+  namespace {
+    template<typename T>
+    std::unique_ptr<Distance<T>> make_node_distance(Metric metric, VectorType type) {
+      if (type == VectorType::RAW)
+        return std::unique_ptr<Distance<T>>(get_distance_function<T>(metric));
+      if (type == VectorType::RABITQ8)
+        return std::make_unique<DistanceRaBitQ<T, 8>>(metric);
+      throw std::invalid_argument("Unsupported node vector type");
+    }
+  }  // namespace
 
   // Copy file using direct I/O. File size must be 4KB-aligned.
   void copy_file(const std::string &src, const std::string &dst) {
@@ -61,7 +71,6 @@ namespace pipeann {
                               AbstractNeighbor<T> *nbr_handler, bool tags, IndexBuildParameters *parameters,
                               bool enable_tag2id)
       : reader(file_reader), nbr_handler(nbr_handler), metric(m), enable_tag2id(enable_tag2id), enable_tags(tags) {
-    this->dist_cmp.reset(pipeann::get_distance_function<T>(m));
 
     if (parameters != nullptr) {
       this->params = *parameters;
@@ -96,6 +105,12 @@ namespace pipeann {
       // remove the original tags.
       std::filesystem::remove(prefix_out + "_disk.index.tags");
     }
+
+    SSDIndexMetadata<T> source_meta;
+    source_meta.load_from_disk_index(prefix_in + "_disk.index");
+    auto distance = make_node_distance<T>(metric, source_meta.vector_type);
+    distance->load_metadata(prefix_in + "_disk.index", source_meta.data_dim);
+    distance->save_metadata(prefix_out + "_disk.index");
 
     // nbr.
     this->nbr_handler->load(prefix_in.c_str());
@@ -147,9 +162,7 @@ namespace pipeann {
 
     while (!this->thread_data_bufs.empty()) {
       auto buf = this->thread_data_bufs.back();
-      pipeann::aligned_free((void *) buf->coord_scratch_);
       this->reader->free_io_buf((void *) buf->sector_scratch);
-      pipeann::aligned_free((void *) buf->nbr_vec_scratch);
       pipeann::aligned_free((void *) buf->nbr_ctx_scratch);
       pipeann::aligned_free((void *) buf->aligned_dist_scratch);
       pipeann::aligned_free((void *) buf->aligned_query_);
@@ -179,6 +192,8 @@ namespace pipeann {
 
     // load nbrs (e.g., PQ)
     nbr_handler->load(index_prefix);
+    node_distance_ = make_node_distance<T>(metric, meta_.vector_type);
+    node_distance_->load_metadata(disk_index_file, meta_.data_dim);
 
     // read index metadata
     // open AlignedFileReader handle to index_file
@@ -276,7 +291,8 @@ namespace pipeann {
     size_t tag_num, tag_dim;
     std::vector<TagT> tag_v;
     this->tags.clear();
-    if (enable_tag2id) this->tag2id_.clear();
+    if (enable_tag2id)
+      this->tag2id_.clear();
 
     if (!file_exists(tag_file_name)) {
       LOG(INFO) << "Tags file not found. Using equal mapping";
@@ -285,7 +301,8 @@ namespace pipeann {
       LOG(INFO) << "Load tags from existing file: " << tag_file_name;
       pipeann::load_bin<TagT>(tag_file_name, tag_v, tag_num, tag_dim, offset);
       tags.reserve(tag_v.size());
-      if (enable_tag2id) tag2id_.reserve(tag_v.size());
+      if (enable_tag2id)
+        tag2id_.reserve(tag_v.size());
 
 #pragma omp parallel for
       for (size_t i = 0; i < tag_num; ++i) {
@@ -300,7 +317,14 @@ namespace pipeann {
   Index<T, TagT> *SSDIndex<T, TagT>::load_to_mem(const std::string &disk_file, Metric metric) {
     SSDIndexMetadata<T> meta;
     meta.load_from_disk_index(disk_file);
-    auto mem = new Index<T, TagT>(metric, meta);
+    std::unique_ptr<AbstractNeighbor<T>> vectors;
+    if (meta.vector_type != VectorType::RAW) {
+      vectors = std::make_unique<RaBitQNeighbor<T, 8>>(metric);
+      vectors->load_metadata(disk_file.c_str());
+    }
+    if (!vectors) vectors = std::make_unique<RawNeighbor<T>>(metric, meta.data_dim);
+    vectors->reserve(meta.npoints);
+    std::vector<std::vector<unsigned>> graph(meta.npoints);
 
     constexpr uint64_t kTargetBatchBytes = 64 << 20;  // ~64 MiB per I/O.
     const uint64_t unit_bytes = meta.io_size_dense();
@@ -314,12 +338,13 @@ namespace pipeann {
 
     for (uint64_t loc = 0; loc < meta.npoints;) {
       const uint64_t cur_nodes = std::min(batch_units * unit_nodes, meta.npoints - loc);
-      std::ignore = pread(fd, buf, DIV_ROUND_UP(cur_nodes, unit_nodes) * unit_bytes, meta.loc_sector_no(loc) * SECTOR_LEN);
+      std::ignore =
+          pread(fd, buf, DIV_ROUND_UP(cur_nodes, unit_nodes) * unit_bytes, meta.loc_sector_no(loc) * SECTOR_LEN);
 
       for (uint64_t i = 0; i < cur_nodes; i++, loc++) {
         DiskNode<T> node(buf + (i / unit_nodes) * unit_bytes, (uint32_t) loc, meta);
-        memcpy(mem->_data.data() + loc * meta.data_dim, node.coords, meta.data_dim * sizeof(T));
-        mem->_final_graph[loc].assign(node.nbrs, node.nbrs + node.nnbrs);
+        memcpy(vectors->at(loc), node.coords, vectors->data_size);
+        graph[loc].assign(node.nbrs, node.nbrs + node.nnbrs);
       }
       if (loc % 1000000 < cur_nodes) {
         LOG(INFO) << "Loaded " << loc << "/" << meta.npoints << " nodes.";
@@ -329,6 +354,9 @@ namespace pipeann {
     aligned_free(buf);
     close(fd);
 
+    vectors->npoints = meta.npoints;
+    auto mem = new Index<T, TagT>(meta, std::move(vectors));
+    mem->_final_graph = std::move(graph);
     mem->load_tags(disk_file + ".tags");
     return mem;
   }
@@ -336,11 +364,17 @@ namespace pipeann {
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::save_from_mem(Index<T, TagT> &mem, const std::string &disk_file, uint16_t target_range_dense,
                                         AttrWriter *attr_writer) {
+    const auto name = mem._vectors->get_name();
+    const bool encoded = name == "RaBitQ8";
+    if (name != "RawNeighbor" && !encoded)
+      throw std::invalid_argument("Node representation must be RAW or RaBitQ8");
     const uint64_t range_dense = std::max(target_range_dense, mem.range);
     const uint64_t attr_size = (attr_writer != nullptr) ? attr_writer->attr_size() : 0;
-    const uint64_t max_node_len = (range_dense + 1) * sizeof(uint32_t) + mem._dim * sizeof(T) + attr_size;
+    const uint64_t vec_bytes = encoded ? ROUND_UP(mem._vectors->data_size, 4) : mem._dim * sizeof(T);
+    const uint64_t max_node_len = (range_dense + 1) * sizeof(uint32_t) + vec_bytes + attr_size;
     SSDIndexMetadata<T> meta(mem._nd, mem._dim, mem._ep, max_node_len, SECTOR_LEN / max_node_len, mem.range, attr_size,
-                             mem.R_ood);
+                             mem.R_ood, encoded ? VectorType::RABITQ8 : VectorType::RAW);
+    mem._vectors->save_metadata(disk_file.c_str());
 
     constexpr uint64_t kTargetBatchBytes = 64 << 20;  // ~64 MiB per I/O.
     const uint64_t unit_bytes = meta.io_size_dense();
@@ -364,7 +398,7 @@ namespace pipeann {
       for (uint64_t i = 0; i < cur_nodes; i++) {
         const uint64_t gl = loc + i;
         DiskNode<T> node(buf + (i / unit_nodes) * unit_bytes, (uint32_t) gl, meta);
-        memcpy(node.coords, mem._data.data() + gl * meta.data_dim, meta.data_dim * sizeof(T));
+        memcpy(node.coords, mem._vectors->at(gl), mem._vectors->data_size);
 
         const auto &nbrs = mem._final_graph[gl];
         node.nnbrs = std::min<size_t>(nbrs.size(), meta.range);
@@ -406,7 +440,7 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  int SSDIndex<T, TagT>::get_vector_by_id(const uint32_t &id, T *vector_coords) {
+  int SSDIndex<T, TagT>::get_vector_by_id(const uint32_t &id, void *vector_coords) {
     if (!enable_tags) {
       LOG(INFO) << "Tags are disabled, cannot retrieve vector";
       return -1;
@@ -420,13 +454,14 @@ namespace pipeann {
     disk_reader.seekg(SECTOR_LEN * num_sectors, std::ios::beg);
     disk_reader.read(sector_buf.get(), io_size);
     DiskNode<T> node = node_from_page(sector_buf.get(), loc);
-    memcpy((void *) vector_coords, (void *) node.coords, meta_.data_dim * sizeof(T));
+    memcpy(vector_coords, node.coords, meta_.vector_bytes());
     return 0;
   }
 
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::get_nodes_by_ids(const std::vector<uint32_t> &ids, NodeOut *out) {
-    if (out == nullptr || ids.empty()) return;
+    if (out == nullptr || ids.empty())
+      return;
     if (!enable_tags) {
       LOG(INFO) << "Tags are disabled, cannot retrieve node payloads";
       return;
@@ -452,8 +487,10 @@ namespace pipeann {
       for (size_t j = 0; j < n; ++j) {
         DiskNode<T> node = node_from_page((char *) reqs[j].buf, locs[j]);
         typename NodeOut::mapped_type payload;
-        payload.coords.assign(node.coords, node.coords + meta_.data_dim);
-        if (meta_.attr_size > 0) payload.attrs = Attributes::deserialize((char *) node.attrs);
+        payload.coords.resize(meta_.data_dim);
+        node_distance_->decode(node.coords, payload.coords.data(), meta_.data_dim);
+        if (meta_.attr_size > 0)
+          payload.attrs = Attributes::deserialize((char *) node.attrs);
         out->insert(std::make_pair(id2tag(ids[i + j]), std::move(payload)));
       }
     }
@@ -462,11 +499,12 @@ namespace pipeann {
 
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::get_nodes_by_tags(const std::vector<TagT> &tags_wanted, NodeOut *out) {
-    if (out == nullptr || tags_wanted.empty()) return;
+    if (out == nullptr || tags_wanted.empty())
+      return;
 
     if (!enable_tag2id || tag2id_.empty()) {
-      LOG(ERROR) << "get_nodes_by_tags requires a populated tag2id map (enable_tag2id="
-                 << enable_tag2id << ", tag2id size=" << tag2id_.size() << ")";
+      LOG(ERROR) << "get_nodes_by_tags requires a populated tag2id map (enable_tag2id=" << enable_tag2id
+                 << ", tag2id size=" << tag2id_.size() << ")";
       return;
     }
 
@@ -474,7 +512,8 @@ namespace pipeann {
     ids.reserve(tags_wanted.size());
     uint32_t id;
     for (auto tag : tags_wanted) {
-      if (tag2id_.find(tag, id)) ids.push_back(id);
+      if (tag2id_.find(tag, id))
+        ids.push_back(id);
     }
 
     get_nodes_by_ids(ids, out);

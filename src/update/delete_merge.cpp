@@ -4,6 +4,7 @@
 #include "ssd_index.h"
 #include <malloc.h>
 #include <algorithm>
+#include <filesystem>
 
 #include <omp.h>
 #include <chrono>
@@ -196,22 +197,16 @@ namespace pipeann {
         if (nhood.size() > this->params.R) {
           std::vector<float> dists(nhood.size(), 0.0f);
           std::vector<Neighbor> pool(nhood.size());
-          // Use dynamic buffer instead of pre-initialized buffer to save space.
-          uint8_t *pq_buf = nullptr;
-          pipeann::alloc_aligned((void **) &pq_buf, nhood.size() * AbstractNeighbor<T>::MAX_BYTES_PER_NBR, 256);
-          nbr_handler->compute_dists(id, nhood.data(), nhood.size(), dists.data(), pq_buf);
+          nbr_handler->compute_dists(id, nhood.data(), nhood.size(), dists.data());
 
           for (uint32_t k = 0; k < nhood.size(); k++) {
             pool[k].id = nhood[k];
             pool[k].distance = dists[k];
           }
           auto nbr = this->nbr_handler;
-          pipeann::prune_neighbors(pool, nhood, params, metric, [nbr, pq_buf](uint32_t a, uint32_t b) {
-            float dist;
-            nbr->compute_dists(a, &b, 1, &dist, pq_buf);
-            return dist;
+          pipeann::prune_neighbors(pool, nhood, params, metric, [nbr](uint32_t a, const uint32_t *ids, size_t n, float *out) {
+            nbr->compute_dists(a, ids, n, out);
           });
-          pipeann::aligned_free(pq_buf);
         }
 
         // map to new IDs.
@@ -229,7 +224,7 @@ namespace pipeann {
         auto page_wbuf = wbuf + (loc_sector_no(off) - loc_sector_no(0)) * SECTOR_LEN;
         DiskNode<T> w_node = node_from_page(page_wbuf, new_id);
 
-        memcpy(w_node.coords, node.coords, meta_.data_dim * sizeof(T));
+        memcpy(w_node.coords, node.coords, meta_.vector_bytes());
         w_node.nnbrs = nhood.size();
         *(w_node.nbrs - 1) = w_node.nnbrs;
         memcpy(w_node.nbrs, nhood.data(), w_node.nnbrs * sizeof(uint32_t));
@@ -289,19 +284,19 @@ namespace pipeann {
       set_loc2id(i, i);
     }
 
-    this->write_metadata_and_pq(in_path_prefix, out_path_prefix, &new_tags);
+    this->write_metadata_and_pq(out_path_prefix, &new_tags);
     LOG(INFO) << "Write metadata and PQ finished, totally elapsed " << delete_timer.elapsed() / 1e3 << "ms.";
 
     return id_map;
   }
 
   template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::write_metadata_and_pq(const std::string &in_path_prefix, const std::string &out_path_prefix,
-                                                std::vector<TagT> *new_tags) {
+  void SSDIndex<T, TagT>::write_metadata_and_pq(const std::string &out_path_prefix, std::vector<TagT> *new_tags) {
     // Use meta_ directly since it's already been updated
     meta_.print();
     std::string disk_index_out = out_path_prefix + "_disk.index";
     meta_.save_to_disk_index(disk_index_out);
+    node_distance_->save_metadata(disk_index_out);
 
     // Step 3. Write tags and PQ.
     std::vector<TagT> tags_vec;

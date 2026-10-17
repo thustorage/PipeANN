@@ -483,7 +483,7 @@ void CollectionStore::build_output(Collection *col, const std::vector<std::strin
       oc.dim = col->meta.dim;
       for (const auto &r : rows) {
         if (r.payload != nullptr && r.payload->coords.size() == col->meta.dim) {
-          for (float c : r.payload->coords) oc.vectors.push_back(c);
+          oc.vectors.insert(oc.vectors.end(), r.payload->coords.begin(), r.payload->coords.end());
         } else {
           for (uint32_t d = 0; d < col->meta.dim; d++) oc.vectors.push_back(0.0f);
         }

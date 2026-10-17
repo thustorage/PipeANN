@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include <cblas.h>
+#include "utils/prune_neighbors.h"
 #include <omp.h>
 
 #include "utils/pipnn.h"
@@ -16,97 +16,6 @@
 #include "utils/timer.h"
 
 namespace pipeann {
-
-  // --- HashPruner implementation ---
-
-  template<typename T>
-  HashPruner::HashPruner(int64_t num_nodes, int64_t dims, int num_hyperplanes, int climit, const T *raw_data,
-                         uint32_t seed)
-      : _norm_vectors(nullptr), _sketch(nullptr), _reservoirs(num_nodes), _num_hyperplanes(num_hyperplanes),
-        _dims(dims), _num_nodes(num_nodes), _climit(climit) {
-    _norm_vectors = new float[num_hyperplanes * dims];
-    std::mt19937 g(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (int i = 0; i < num_hyperplanes * dims; i++) {
-      _norm_vectors[i] = dist(g);
-    }
-
-    // _sketch = raw_data (num_nodes x dims) x _norm_vectors^T (dims x num_hyperplanes)
-    // Partition nodes into batches to limit temporary float buffer memory.
-    _sketch = new float[num_nodes * num_hyperplanes];
-    constexpr int64_t BATCH_SIZE = 100000;
-    std::vector<float> buf;
-    for (int64_t offset = 0; offset < num_nodes; offset += BATCH_SIZE) {
-      int64_t batch = std::min(BATCH_SIZE, num_nodes - offset);
-      const float *batch_data;
-      if constexpr (std::is_same_v<T, float>) {
-        batch_data = raw_data + offset * dims;
-      } else {
-        buf.resize(batch * dims);
-        const T *src = raw_data + offset * dims;
-        for (int64_t i = 0; i < batch * dims; i++) {
-          buf[i] = static_cast<float>(src[i]);
-        }
-        batch_data = buf.data();
-      }
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, batch, num_hyperplanes, dims, 1.0f, batch_data, dims,
-                  _norm_vectors, dims, 0.0f, _sketch + offset * num_hyperplanes, num_hyperplanes);
-    }
-  }
-
-  template HashPruner::HashPruner(int64_t, int64_t, int, int, const float *, uint32_t);
-  template HashPruner::HashPruner(int64_t, int64_t, int, int, const int8_t *, uint32_t);
-  template HashPruner::HashPruner(int64_t, int64_t, int, int, const uint8_t *, uint32_t);
-
-  HashPruner::~HashPruner() {
-    delete[] _norm_vectors;
-    delete[] _sketch;
-  }
-
-  void HashPruner::update(const std::vector<WeightedEdge> &edges) {
-    for (const auto &edge : edges) {
-      uint32_t u = edge.u;
-      uint32_t v = edge.v;
-      float dist = edge.dist;
-
-      uint16_t hash = 0;
-      for (int h = 0; h < _num_hyperplanes; h++) {
-        float diff = _sketch[u * _num_hyperplanes + h] - _sketch[v * _num_hyperplanes + h];
-        hash = (hash << 1) | (diff >= 0 ? 1 : 0);
-      }
-
-      auto &M = _reservoirs[u];
-
-      auto it = std::lower_bound(M.begin(), M.end(), HashPruneSlot{hash, 0, 0});
-      if (it != M.end() && it->hash == hash) {
-        if (dist < it->dist) {
-          it->id = v;
-          it->dist = dist;
-        }
-      } else {
-        if (M.size() < _climit) {
-          M.insert(it, {hash, v, dist});
-        } else {
-          auto farthest = std::max_element(
-              M.begin(), M.end(), [](const HashPruneSlot &a, const HashPruneSlot &b) { return a.dist < b.dist; });
-          if (dist < farthest->dist) {
-            M.erase(farthest);
-            it = std::lower_bound(M.begin(), M.end(), HashPruneSlot{hash, 0, 0});
-            M.insert(it, {hash, v, dist});
-          }
-        }
-      }
-    }
-  }
-
-  void HashPruner::to_graph(std::vector<std::vector<unsigned>> &final_graph) {
-    final_graph.resize(_num_nodes);
-    for (int64_t u = 0; u < _num_nodes; u++) {
-      for (const auto &slot : _reservoirs[u]) {
-        final_graph[u].push_back(slot.id);
-      }
-    }
-  }
 
   // --- Index pipnn methods ---
 
@@ -127,7 +36,37 @@ namespace pipeann {
 
     LOG(INFO) << "Using PiPNN builder, Threads: " << omp_get_max_threads();
     auto &pc = params.pipnn_config;
-    HashPruner pruner(total_node, _dim, pc.num_hyperplanes, pc.climit, _data.data(), pc.seed);
+    // Keep at most twice the retained capacity per source before distance pruning.
+    const size_t capacity = std::max<size_t>(params.R, std::max(1, pc.climit));
+    std::vector<std::vector<Neighbor>> candidates(total_node);
+    auto prune = [&](uint32_t source, size_t range) {
+      auto &pool = candidates[source];
+      auto prune_params = params;
+      prune_params.R = range;
+      prune_params.C = std::max<size_t>(params.C, pool.size());
+      std::vector<uint32_t> kept;
+      prune_neighbors(pool, kept, prune_params, _dist_metric,
+                      [&](uint32_t a, const uint32_t *ids, size_t n, float *out) {
+        _vectors->compute_dists(a, ids, n, out);
+      });
+      std::vector<Neighbor> retained;
+      retained.reserve(kept.size());
+      for (auto id : kept) {
+        auto it = std::find_if(pool.begin(), pool.end(), [id](const Neighbor &n) { return n.id == id; });
+        retained.push_back(*it);
+      }
+      pool.swap(retained);
+    };
+    auto update = [&](const std::vector<WeightedEdge> &edges) {
+      for (const auto &edge : edges) {
+        if (edge.u == edge.v) continue;
+        auto &pool = candidates[edge.u];
+        auto it = std::find_if(pool.begin(), pool.end(), [&](const Neighbor &n) { return n.id == edge.v; });
+        if (it != pool.end()) { it->distance = std::min(it->distance, edge.dist); continue; }
+        pool.emplace_back(edge.v, edge.dist);
+        if (pool.size() >= 2 * capacity) prune(edge.u, capacity);
+      }
+    };
 
     pipeann::Timer link_timer;
 
@@ -177,7 +116,7 @@ namespace pipeann {
         int tid = omp_get_thread_num();
 
         for (int t = 0; t < num_threads_used; t++) {
-          pruner.update(buckets[t * num_buckets + tid]);
+          update(buckets[t * num_buckets + tid]);
         }
       }
 
@@ -192,9 +131,13 @@ namespace pipeann {
     LOG(INFO) << "Finish Leaf build, total build " << total_build_time << "s, total update " << total_update_time
               << "s";
 
-    pruner.to_graph(_final_graph);
-
-    final_prune(params);
+#pragma omp parallel for schedule(dynamic, 256)
+    for (int64_t u = 0; u < total_node; ++u) {
+      if (candidates[u].size() > params.R) prune(u, params.R);
+      auto &neighbors = _final_graph[u];
+      neighbors.clear();
+      for (const auto &candidate : candidates[u]) neighbors.push_back(candidate.id);
+    }
     if (_nd > 0) {
       LOG(INFO) << "done. Link time: " << ((double) link_timer.elapsed() / (double) 1000000) << "s";
     }
@@ -266,92 +209,41 @@ namespace pipeann {
       int num_centers = centers.size();
       Partition partitions(num_centers);
 
+      auto assign_batch = [&](size_t start, size_t end, Partition &out) {
+        const size_t size = end - start;
+        std::vector<float> distances(size * num_centers);
+        for (size_t i = 0; i < size; ++i)
+          _vectors->compute_dists(nodes[start + i], centers.data(), num_centers,
+                                  distances.data() + i * num_centers);
+
+        std::vector<std::pair<float, int>> ranked(num_centers);
+        const int n_select = std::min(local_fanout, num_centers);
+        for (size_t i = 0; i < size; ++i) {
+          for (int j = 0; j < num_centers; ++j)
+            ranked[j] = {distances[i * num_centers + j], j};
+          std::partial_sort(ranked.begin(), ranked.begin() + n_select, ranked.end());
+          for (int k = 0; k < n_select; ++k)
+            out[ranked[k].second].push_back(nodes[start + i]);
+        }
+      };
+
       if (use_parallel && nodes.size() > 10000) {
-        // Parallel version
-        std::vector<T> center_data(num_centers * _dim);
-        for (int i = 0; i < num_centers; i++) {
-          std::copy_n(_data.data() + _dim * (size_t) centers[i], _dim, center_data.data() + i * _dim);
-        }
-
-        int num_threads = omp_get_max_threads();
-        const size_t BATCH_SIZE = 10000;
-        size_t num_batches = (nodes.size() + BATCH_SIZE - 1) / BATCH_SIZE;
-
+        const int num_threads = omp_get_max_threads();
+        const size_t batch_size = 10000;
+        const size_t num_batches = (nodes.size() + batch_size - 1) / batch_size;
         std::vector<Partition> local_partitions(num_threads, Partition(num_centers));
-
 #pragma omp parallel for schedule(dynamic)
-        for (size_t b = 0; b < num_batches; b++) {
-          size_t batch_start = b * BATCH_SIZE;
-          size_t batch_end = std::min(batch_start + BATCH_SIZE, nodes.size());
-          size_t batch_size = batch_end - batch_start;
-
-          std::vector<T> node_data_batch(batch_size * _dim);
-          for (size_t i = 0; i < batch_size; i++) {
-            std::copy_n(_data.data() + _dim * (size_t) nodes[batch_start + i], _dim, node_data_batch.data() + i * _dim);
-          }
-
-          std::vector<float> dist_batch(batch_size * num_centers);
-          _distance->bulk_compare(node_data_batch.data(), batch_size, center_data.data(), num_centers, _dim,
-                                  dist_batch.data());
-
-          int tid = omp_get_thread_num();
-          auto &my_partitions = local_partitions[tid];
-
-          for (size_t i = 0; i < batch_size; i++) {
-            std::vector<std::pair<float, int>> dists(num_centers);
-            for (int j = 0; j < num_centers; j++) {
-              dists[j] = {dist_batch[i * num_centers + j], j};
-            }
-
-            int n_select = std::min(local_fanout, num_centers);
-            std::partial_sort(dists.begin(), dists.begin() + n_select, dists.end());
-
-            for (int k = 0; k < n_select; k++) {
-              my_partitions[dists[k].second].push_back(nodes[batch_start + i]);
-            }
-          }
+        for (size_t b = 0; b < num_batches; ++b) {
+          const size_t start = b * batch_size;
+          assign_batch(start, std::min(start + batch_size, nodes.size()), local_partitions[omp_get_thread_num()]);
         }
-
-        for (int t = 0; t < num_threads; t++) {
-          for (int p = 0; p < num_centers; p++) {
-            partitions[p].insert(partitions[p].end(), local_partitions[t][p].begin(), local_partitions[t][p].end());
-          }
-        }
+        for (const auto &local : local_partitions)
+          for (int p = 0; p < num_centers; ++p)
+            partitions[p].insert(partitions[p].end(), local[p].begin(), local[p].end());
       } else {
-        // Sequential version (batched bulk_compare)
-        std::vector<T> center_data(num_centers * _dim);
-        for (int i = 0; i < num_centers; i++) {
-          std::copy_n(_data.data() + _dim * (size_t) centers[i], _dim, center_data.data() + i * _dim);
-        }
-
-        const size_t BATCH_SIZE = 2048;
-        for (size_t batch_start = 0; batch_start < nodes.size(); batch_start += BATCH_SIZE) {
-          size_t batch_end = std::min(batch_start + BATCH_SIZE, nodes.size());
-          size_t batch_size = batch_end - batch_start;
-
-          std::vector<T> node_data_batch(batch_size * _dim);
-          for (size_t i = 0; i < batch_size; i++) {
-            std::copy_n(_data.data() + _dim * (size_t) nodes[batch_start + i], _dim, node_data_batch.data() + i * _dim);
-          }
-
-          std::vector<float> dist_batch(batch_size * num_centers);
-          _distance->bulk_compare(node_data_batch.data(), batch_size, center_data.data(), num_centers, _dim,
-                                  dist_batch.data());
-
-          for (size_t i = 0; i < batch_size; i++) {
-            std::vector<std::pair<float, int>> dists(num_centers);
-            for (int j = 0; j < num_centers; j++) {
-              dists[j] = {dist_batch[i * num_centers + j], j};
-            }
-
-            int n_select = std::min(local_fanout, num_centers);
-            std::partial_sort(dists.begin(), dists.begin() + n_select, dists.end());
-
-            for (int k = 0; k < n_select; k++) {
-              partitions[dists[k].second].push_back(nodes[batch_start + i]);
-            }
-          }
-        }
+        const size_t batch_size = 2048;
+        for (size_t start = 0; start < nodes.size(); start += batch_size)
+          assign_batch(start, std::min(start + batch_size, nodes.size()), partitions);
       }
 
       return partitions;
@@ -428,13 +320,9 @@ namespace pipeann {
     if (n <= 1)
       return edges;
 
-    std::vector<T> node_data(n * _dim);
-    for (size_t i = 0; i < n; i++) {
-      std::copy_n(_data.data() + _dim * (size_t) nodes[i], _dim, node_data.data() + i * _dim);
-    }
-
     std::vector<float> distances(n * n);
-    _distance->bulk_compare(node_data.data(), n, node_data.data(), n, _dim, distances.data());
+    for (size_t i = 0; i < n; ++i)
+      _vectors->compute_dists(nodes[i], nodes.data(), n, distances.data() + i * n);
 
     for (size_t i = 0; i < n; i++) {
       std::vector<std::pair<float, size_t>> dists;

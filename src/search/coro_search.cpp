@@ -28,12 +28,9 @@ namespace pipeann {
                                         const uint64_t beam_width, int N) {
     // beam search with intra-thread parallelism.
     static constexpr int kMaxCoroPerThread = 8;
-    static constexpr int kMaxVectorDim = 512;
     struct alignas(SECTOR_LEN) CoroDataOne {
       // buffer.
       char sectors[SECTOR_LEN * 128];  // align to SECTOR_LEN.
-      T query[kMaxVectorDim];
-      T data_buf[ROUND_UP(kMaxVectorDim, 256)];
       uint64_t sector_idx;
 
       QueryBuffer query_buf;
@@ -71,7 +68,7 @@ namespace pipeann {
       }
 
       void compute_and_add_to_retset(const unsigned *node_ids, const uint64_t n_ids) {
-        parent->nbr_handler->compute_dists(&query_buf, node_ids, n_ids);
+        parent->nbr_handler->compute_dists(query_buf.nbr_ctx_scratch, node_ids, n_ids, query_buf.aligned_dist_scratch);
         for (uint64_t i = 0; i < n_ids; ++i) {
           // Unfiltered search: seeds and expansion nodes share is_member_approx so
           // the pool stays monotone in distance (is_member_approx is the primary
@@ -135,16 +132,15 @@ namespace pipeann {
           auto [id, loc, sector_buf] = frontier_nhood;
           auto node = parent->node_from_page(sector_buf, loc);
 
-          T *node_fp_coords_copy = data_buf;
-          memcpy(node_fp_coords_copy, node.coords, parent->meta_.data_dim * sizeof(T));
           float cur_expanded_dist =
-              parent->dist_cmp->compare(query, node_fp_coords_copy, (unsigned) parent->aligned_dim);
+              parent->node_distance_->compare_sym(query_buf.aligned_query_, node.coords, parent->meta_.data_dim);
 
           Neighbor n(id, cur_expanded_dist);
           full_retset.push_back(n);
 
           // compute node_nbrs <-> query dist in PQ space
-          parent->nbr_handler->compute_dists(&query_buf, node.nbrs, node.nnbrs);
+          parent->nbr_handler->compute_dists(query_buf.nbr_ctx_scratch, node.nbrs, node.nnbrs,
+                                             query_buf.aligned_dist_scratch);
 
           // process prefetch-ed nhood
           for (uint64_t m = 0; m < node.nnbrs; ++m) {
@@ -189,33 +185,32 @@ namespace pipeann {
     }
 
     // do not use the thread data's buf.
-    QueryBuffer *thread_data = pop_query_buf(queries[0]);
+    QueryBuffer *thread_data = pop_query_buf(nullptr);
     void *ctx = reader->get_ctx();
     // lambda to batch compute query<-> node distances in PQ space
 
     for (int v = 0; v < N; ++v) {
       auto &coro_data = data->data[v];
-      auto &query1 = queries[v];
-      memcpy(coro_data.query, query1, this->meta_.data_dim * sizeof(T));
-
-      auto &query = coro_data.query;
-
-      // pointers to buffers for data
-      T *data_buf = coro_data.data_buf;
-      pipeann::cpu_prefetch_t1((char *) data_buf);
+      const T *query = queries[v];
+      if (metric == Metric::COSINE) {
+        T *normalized = coro_data.query_buf.template aligned_query<T>();
+        normalize_data(normalized, query, meta_.data_dim);
+        query = normalized;
+      }
 
       // query <-> PQ chunk centers distances
-      nbr_handler->initialize_query(query, &coro_data.query_buf);
 
       coro_data.reset(l_search);
 
       if (mem_L) {
         std::vector<unsigned> mem_tags(mem_L);
         std::vector<float> mem_dists(mem_L);
-        mem_index_->search_with_tags(query, mem_L, mem_L, mem_tags.data(), mem_dists.data());
-        coro_data.compute_and_add_to_retset(mem_tags.data(), std::min((unsigned) mem_L, (unsigned) l_search));
+        const size_t found = mem_index_->search_with_tags(queries[v], mem_L, mem_L, mem_tags.data(), mem_dists.data());
+        initialize_query(query, &coro_data.query_buf);
+        coro_data.compute_and_add_to_retset(mem_tags.data(), std::min<uint64_t>(found, l_search));
       } else {
         // Do not use optimized start point.
+        initialize_query(query, &coro_data.query_buf);
         coro_data.compute_and_add_to_retset(&meta_.entry_point_id, 1);
       }
     }

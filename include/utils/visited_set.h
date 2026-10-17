@@ -12,8 +12,9 @@ namespace pipeann {
   // probing, power-of-two capacity. Exists because the visited check runs once
   // per scanned neighbor (~100k/query at large L) and dominates when the probe
   // misses cache: unlike a generic hash set, the probe target address is a pure
-  // function of the key, so the search loop can prefetch() a neighbor's slot a
-  // few iterations ahead of insert() and hide the miss entirely.
+  // function of the key, so the search loop can prefetch() a neighbor's first
+  // probe slot ahead of insert(). This can overlap the fetch with other work;
+  // it does not guarantee a cache hit or cover a dependent collision chain.
   //
   // The empty slot marker doubles as kInvalidID, which can never be a real
   // vector id; a one-bit side flag keeps the set correct even if a caller
@@ -38,7 +39,7 @@ namespace pipeann {
       has_empty_key_ = false;
     }
 
-    // Prefetch the probe line for key, so a later insert(key) hits cache.
+    // Start fetching the first probe line for a later insert(key).
     inline void prefetch(uint32_t key) const {
       pipeann::cpu_prefetch_t0((const char *) &slots_[slot_of(key)]);
     }

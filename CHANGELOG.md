@@ -1,6 +1,10 @@
 # Changelog
 
-## v0.4.0 (unreleased)
+## v0.4.0
+
+### RaBitQ8 on-disk indexes
+
+Store vectors as RaBitQ8 directly on SSD, independently of the in-memory navigation encoding. Recommended for high-dimensional float vectors (512+ dimensions), with smaller indexes and faster search at little recall loss. See the [build and search tutorial](docs/cpp-interface.md#rabitq8-on-disk-vectors).
 
 ### Milvus-compatible collection engine
 

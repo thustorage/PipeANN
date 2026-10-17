@@ -33,13 +33,10 @@ namespace pipeann {
 
     query_buf->reset();
 
-    T *data_buf = query_buf->coord_scratch<T>();
-    pipeann::cpu_prefetch_t1((char *) data_buf);
 
     char *sector_scratch = query_buf->sector_scratch;
     uint64_t &sector_scratch_idx = query_buf->sector_idx;
 
-    nbr_handler->initialize_query(query, query_buf);
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
     Timer query_timer, io_timer, cpu_timer;
@@ -51,16 +48,15 @@ namespace pipeann {
     uint64_t coord_buf_idx = 0;
 
     auto compute_exact_dist_and_push = [&](const DiskNode<T> &node, const unsigned id) -> float {
-      memcpy(data_buf, node.coords, meta_.data_dim * sizeof(T));
-      float cur_expanded_dist = dist_cmp->compare(query, data_buf, (unsigned) aligned_dim);
+      float cur_expanded_dist = node_distance_->compare_sym(query_buf->aligned_query_, node.coords, meta_.data_dim);
       if (insert_ctx != nullptr) {
         if (unlikely(coord_buf_idx >= kExpandedNodesFactor * l_search)) {
           LOG(ERROR) << "Please allocate larger coord_buf.";
           crash();
         }
-        T *coord_ptr = insert_ctx->coord_buf + coord_buf_idx * aligned_dim;
-        memcpy(coord_ptr, node.coords, meta_.data_dim * sizeof(T));
-        insert_ctx->coord_map.insert(std::make_pair(id, coord_ptr));
+        uint8_t *coord_ptr = insert_ctx->coord_buf + coord_buf_idx * meta_.vector_bytes();
+        memcpy(coord_ptr, node.coords, meta_.vector_bytes());
+        insert_ctx->coord_map.insert(std::make_pair(id, static_cast<uint32_t>(coord_buf_idx)));
         coord_buf_idx++;
       }
       full_retset.push_back(Neighbor(id, cur_expanded_dist));
@@ -68,7 +64,7 @@ namespace pipeann {
     };
 
     auto compute_and_add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids) {
-      nbr_handler->compute_dists(query_buf, node_ids, n_ids);
+      nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, node_ids, n_ids, query_buf->aligned_dist_scratch);
       for (uint64_t i = 0; i < n_ids; ++i) {
         // Unfiltered search: seeds and expansion nodes share is_member_approx so
         // the pool stays monotone in distance (is_member_approx is the primary
@@ -81,9 +77,11 @@ namespace pipeann {
     if (mem_L) {
       std::vector<unsigned> mem_tags(mem_L);
       std::vector<float> mem_dists(mem_L);
-      mem_index_->search_with_tags(query, mem_L, mem_L, mem_tags.data(), mem_dists.data());
-      compute_and_add_to_retset(mem_tags.data(), std::min<uint64_t>(mem_L, l_search));
+      const size_t found = mem_index_->search_with_tags(query1, mem_L, mem_L, mem_tags.data(), mem_dists.data());
+      initialize_query(query, query_buf);
+      compute_and_add_to_retset(mem_tags.data(), std::min<uint64_t>(found, l_search));
     } else {
+      initialize_query(query, query_buf);
       compute_and_add_to_retset(&meta_.entry_point_id, 1);
     }
 
@@ -142,7 +140,7 @@ namespace pipeann {
         compute_exact_dist_and_push(node, id);
 
         cpu_timer.reset();
-        nbr_handler->compute_dists(query_buf, node.nbrs, node.nnbrs);
+        nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, node.nbrs, node.nnbrs, query_buf->aligned_dist_scratch);
         if (stats != nullptr) {
           stats->n_cmps += (double) node.nnbrs;
           stats->cpu_us += (double) cpu_timer.elapsed();

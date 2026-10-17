@@ -320,7 +320,9 @@ namespace pipeann {
 #endif  // USE_AVX512
 
   // L2 distance functions.
-  float DistanceL2Int8::compare(const int8_t *pX, const int8_t *pY, uint32_t length) const {
+  float DistanceL2Int8::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const int8_t *>(a);
+    const auto *pY = static_cast<const int8_t *>(b);
     const std::int8_t *pEnd64 = pX + ((length >> 6) << 6);
     const std::int8_t *pEnd32 = pX + ((length >> 5) << 5);
     const std::int8_t *pEnd16 = pX + ((length >> 4) << 4);
@@ -367,7 +369,9 @@ namespace pipeann {
     return diff;
   }
 
-  float DistanceL2UInt8::compare(const uint8_t *pX, const uint8_t *pY, uint32_t length) const {
+  float DistanceL2UInt8::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const uint8_t *>(a);
+    const auto *pY = static_cast<const uint8_t *>(b);
     const std::uint8_t *pEnd64 = pX + ((length >> 6) << 6);
     const std::uint8_t *pEnd32 = pX + ((length >> 5) << 5);
     const std::uint8_t *pEnd16 = pX + ((length >> 4) << 4);
@@ -412,7 +416,9 @@ namespace pipeann {
     return diff;
   }
 
-  float DistanceL2Float::compare(const float *pX, const float *pY, uint32_t length) const {
+  float DistanceL2Float::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const float *>(a);
+    const auto *pY = static_cast<const float *>(b);
     const float *pEnd16 = pX + ((length >> 4) << 4);
     const float *pEnd8 = pX + ((length >> 3) << 3);
     const float *pEnd4 = pX + ((length >> 2) << 2);
@@ -447,7 +453,9 @@ namespace pipeann {
   }
 
   // Cosine distance functions (inner product based, assumes normalized vectors).
-  float DistanceCosineInt8::compare(const int8_t *pX, const int8_t *pY, uint32_t length) const {
+  float DistanceCosineInt8::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const int8_t *>(a);
+    const auto *pY = static_cast<const int8_t *>(b);
     const std::int8_t *pEnd32 = pX + ((length >> 5) << 5);
     const std::int8_t *pEnd16 = pX + ((length >> 4) << 4);
     const std::int8_t *pEnd4 = pX + ((length >> 2) << 2);
@@ -488,10 +496,12 @@ namespace pipeann {
     }
     while (pX < pEnd1)
       diff += ((float) (*pX++) * (float) (*pY++));
-    return 16129 - diff;
+    return metric_scale<int8_t>() - diff;
   }
 
-  float DistanceCosineUInt8::compare(const uint8_t *pX, const uint8_t *pY, uint32_t length) const {
+  float DistanceCosineUInt8::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const uint8_t *>(a);
+    const auto *pY = static_cast<const uint8_t *>(b);
     const std::uint8_t *pEnd64 = pX + ((length >> 6) << 6);
     const std::uint8_t *pEnd32 = pX + ((length >> 5) << 5);
     const std::uint8_t *pEnd16 = pX + ((length >> 4) << 4);
@@ -531,10 +541,12 @@ namespace pipeann {
     }
     while (pX < pEnd1)
       diff += ((float) (*pX++) * (float) (*pY++));
-    return 65025 - diff;
+    return metric_scale<uint8_t>() - diff;
   }
 
-  float DistanceCosineFloat::compare(const float *pX, const float *pY, uint32_t length) const {
+  float DistanceCosineFloat::compare(const void *a, const void *b, uint32_t length) const {
+    const auto *pX = static_cast<const float *>(a);
+    const auto *pY = static_cast<const float *>(b);
     const float *pEnd16 = pX + ((length >> 4) << 4);
     const float *pEnd8 = pX + ((length >> 3) << 3);
     const float *pEnd4 = pX + ((length >> 2) << 2);
@@ -563,7 +575,7 @@ namespace pipeann {
 #endif
     while (pX < pEnd1)
       diff += (*pX++) * (*pY++);
-    return 1 - diff;
+    return metric_scale<float>() - diff;
   }
 
   // Shared BLAS-based L2 bulk distance: result[i][j] = ||a_i - b_j||^2
@@ -635,7 +647,7 @@ namespace pipeann {
 
   void DistanceCosineFloat::bulk_compare(const float *a, size_t n, const float *b, size_t m, unsigned length,
                                          float *result) const {
-    bulk_cosine_float(a, n, b, m, length, result, 1.0f);
+    bulk_cosine_float(a, n, b, m, length, result, metric_scale<float>());
   }
 
   void DistanceL2Int8::bulk_compare(const int8_t *a, size_t n, const int8_t *b, size_t m, unsigned length,
@@ -677,7 +689,7 @@ namespace pipeann {
       pipeann::convert_types(b, fb.data(), m, length);
       fb_ptr = fb.data();
     }
-    bulk_cosine_float(fa.data(), n, fb_ptr, m, length, result, 16129.0f);
+    bulk_cosine_float(fa.data(), n, fb_ptr, m, length, result, metric_scale<int8_t>());
   }
 
   void DistanceCosineUInt8::bulk_compare(const uint8_t *a, size_t n, const uint8_t *b, size_t m, unsigned length,
@@ -691,6 +703,23 @@ namespace pipeann {
       pipeann::convert_types(b, fb.data(), m, length);
       fb_ptr = fb.data();
     }
-    bulk_cosine_float(fa.data(), n, fb_ptr, m, length, result, 65025.0f);
+    bulk_cosine_float(fa.data(), n, fb_ptr, m, length, result, metric_scale<uint8_t>());
   }
+
+  // Explicit instantiations for the supported input types and code widths.
+  template class DistancePQ<float>;
+  template class DistanceRaBitQ<float, 1>;
+  template class DistanceRaBitQ<float, 2>;
+  template class DistanceRaBitQ<float, 4>;
+  template class DistanceRaBitQ<float, 8>;
+  template class DistancePQ<int8_t>;
+  template class DistanceRaBitQ<int8_t, 1>;
+  template class DistanceRaBitQ<int8_t, 2>;
+  template class DistanceRaBitQ<int8_t, 4>;
+  template class DistanceRaBitQ<int8_t, 8>;
+  template class DistancePQ<uint8_t>;
+  template class DistanceRaBitQ<uint8_t, 1>;
+  template class DistanceRaBitQ<uint8_t, 2>;
+  template class DistanceRaBitQ<uint8_t, 4>;
+  template class DistanceRaBitQ<uint8_t, 8>;
 }  // namespace pipeann

@@ -100,7 +100,7 @@ build/tests/build_disk_index uint8 data.bin index 96 9 32 256 112 l2 pq 10
 | `L2` | `0` or omitted → Vamana. `L2 > 0` → PiPNN. Typically `L1 * L2 ≈ L`. |
 | `PQ_bytes` | Bytes per PQ vector. `32` is a good default; raise if accuracy is low. |
 | `M_GB` | Max memory (GB). PiPNN currently ignores this budget. |
-| `nbr_type` | `pq` (supports update), `rabitq` (1-bit, search-only), `rabitq{3-5}` (3–5-bit, search-only). |
+| `nbr_type` | In-memory navigation encoding: `pq`, `rabitq` (1-bit), `rabitq2`, `rabitq4`, or `rabitq8`. Independent of the on-disk vector format. |
 
 **Recommended Vamana parameters:**
 
@@ -112,18 +112,38 @@ build/tests/build_disk_index uint8 data.bin index 96 9 32 256 112 l2 pq 10
 
 Expect ~5h for 100M datasets and ~1d for billion-scale.
 
+### RaBitQ8 On-Disk Vectors
+
+For high-dimensional float vectors (e.g., **512 dimensions or more**), we recommend storing **RaBitQ8 directly on SSD**: it reduces storage and I/O and improves search performance, typically with little recall loss. Vector payloads use about one quarter of the space of float32; graph edges are unchanged. Compression can also fit a vector and its neighbor list into a single 4 KiB page when the original record would span multiple pages, reducing I/O per node.
+
+After [building the binaries](index.md#build), use the original float32 `.bin` base and query files:
+
+```bash
+# Vamana: R=64, L=128, 64-byte PQ navigation, 32 GB build budget, 16 threads.
+# Trailing arguments: L2=0, train_query_path="", R_ood=0, L_ood=1500, node_type=rabitq8.
+build/tests/build_disk_index float base.bin index_rabitq8 \
+    64 128 64 32 16 l2 pq 0 "" 0 1500 rabitq8
+
+# Pipelined search, top-10, no optional entry-point index; sweep L=20/40/80/120.
+build/tests/search_disk_index float index_rabitq8 \
+    16 32 query.bin gt.bin 10 l2 pq 2 0 20 40 80 120
+```
+
+`node_type` is the final build argument (`raw` by default). Search detects it from index metadata; keep `pq` as the navigation type in both commands. Use `null` instead of `gt.bin` if ground truth is unavailable. For cosine or inner product, replace `l2` in both commands with `cosine` or `mips`. Adjust search `L` to reach your target recall.
+
 ### In-Memory Entry-Point Index (optional)
 
-An in-memory index optimizes the entry point. Skip it by setting `mem_L=0` at search time.
+An in-memory index optimizes the entry point. We recommend **RaBitQ8 for this small index as well**; it is the default format for `build_memory_index`. Enable it with `mem_L > 0` at search time (e.g., `10`), or skip it with `mem_L=0`.
 
 ```bash
 build/tests/utils/gen_random_slice uint8 data.bin index_SAMPLE_RATE_0.01 0.01
-build/tests/build_memory_index uint8 index_SAMPLE_RATE_0.01_data.bin index_SAMPLE_RATE_0.01_ids.bin index_mem.index 32 64 1.2 $(nproc) l2
+build/tests/build_memory_index uint8 index_SAMPLE_RATE_0.01_data.bin index_SAMPLE_RATE_0.01_ids.bin \
+    index_mem.index 32 64 1.2 $(nproc) l2 "" 0 1500 rabitq8
 ```
 
-The output lives in two files: `index_mem.index` and `index_mem.index.tags`.
+Keep `index_mem.index`, `index_mem.index.tags`, and the generated `index_mem.index_rabitq_*` metadata files together. Use the same data type, metric, and index prefix as the main disk index.
 
-This index boosts performance for 100-dimensional datasets (SIFT, DEEP, and SPACEV) but may degrade performance for higher-dimensional datasets (e.g., Wiki).
+When using a RaBitQ8 index, this in-memory index typically boosts performance by optimizing the entry point.
 
 !!! note
     PipeANN uses the same SSD layout for the in-memory and on-SSD indexes. It is **not** compatible with DiskANN's or old-version PipeANN's in-memory index format.
@@ -166,7 +186,7 @@ export DATA_PATH=/mnt/nvme/data/bigann/100M.bbin
 
 # Build in-memory entry point index (~10min for 1B vectors)
 build/tests/utils/gen_random_slice uint8 ${DATA_PATH} ${INDEX_PREFIX}_SAMPLE_RATE_0.01 0.01
-build/tests/build_memory_index uint8 ${INDEX_PREFIX}_SAMPLE_RATE_0.01_data.bin ${INDEX_PREFIX}_SAMPLE_RATE_0.01_ids.bin ${INDEX_PREFIX}_mem.index 32 64 1.2 $(nproc) l2
+build/tests/build_memory_index uint8 ${INDEX_PREFIX}_SAMPLE_RATE_0.01_data.bin ${INDEX_PREFIX}_SAMPLE_RATE_0.01_ids.bin ${INDEX_PREFIX}_mem.index 32 64 1.2 $(nproc) l2 "" 0 1500 rabitq8
 
 # Search with PipeANN
 build/tests/search_disk_index uint8 ${INDEX_PREFIX} 1 32 query.bin gt.bin 10 l2 pq 2 10 10 20 30 40

@@ -41,7 +41,7 @@ PipeANN/
 │   ├── nbr/                      # Neighbor storage & quantization
 │   │   ├── abstract_nbr.h             # Base interface for neighbor codecs
 │   │   ├── pq_nbr.h / pq_table.h      # Product-quantized neighbors
-│   │   ├── rabitq_nbr.h / rabitq/     # RaBitQ 1-bit / multi-bit quantization
+│   │   ├── rabitq_nbr.h / rabitq_quantizer.h # RaBitQ 1/2/4/8-bit quantization
 │   │   └── dummy_nbr.h                # No-op codec (debug)
 │   ├── filter/                   # Speculative filtering
 │   │   ├── attribute.h                # AttrIndex (label inverted, range, string-eq) + spmat decode helper

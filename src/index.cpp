@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -32,33 +33,37 @@
 #include "utils/prune_neighbors.h"
 
 namespace pipeann {
-  // Initialize an index with metric m, load the data of type T with filename
-  // (bin). The index will be dynamically resized as needed.
+
   template<typename T, typename TagT>
-  Index<T, TagT>::Index(Metric m, const size_t dim, uint64_t max_points) : _dist_metric(m), _dim(dim) {
+  Index<T, TagT>::Index(std::unique_ptr<AbstractNeighbor<T>> vectors, uint64_t max_points)
+      : _vectors(std::move(vectors)) {
+    if (!_vectors)
+      throw std::invalid_argument("Index requires a Neighbor");
+    _dist_metric = _vectors->metric;
+    _dim = _vectors->dim();
     constexpr uint64_t kLockTableEntries = 131072;  // ~1MB lock table.
     this->_locks = new pipeann::LockTable(kLockTableEntries);
-    LOG(INFO) << "Getting distance function for metric: " << get_metric_str(m);
-    this->_distance = get_distance_function<T>(m);
-    range = 0;
-    if (max_points > 0) {
+    LOG(INFO) << "Getting distance function for metric: " << get_metric_str(_dist_metric);
+    _nd = _vectors->npoints;
+    _ep = 0;
+    if (max_points > this->max_points()) {
       resize(max_points);
+    } else {
+      _final_graph.resize(this->max_points());
     }
   }
 
   template<typename T, typename TagT>
-  Index<T, TagT>::Index(Metric m, const SSDIndexMetadata<T> &meta) : Index(m, meta.data_dim) {
+  Index<T, TagT>::Index(const SSDIndexMetadata<T> &meta, std::unique_ptr<AbstractNeighbor<T>> vectors)
+      : Index(std::move(vectors)) {
     _ep = meta.entry_point;
     range = meta.range;
     R_ood = meta.R_ood;
     R_base = range - R_ood;
-    _nd = meta.npoints;
-    resize(meta.npoints);
   }
 
   template<typename T, typename TagT>
   Index<T, TagT>::~Index() {
-    delete this->_distance;
     delete this->_locks;
   }
 
@@ -66,105 +71,55 @@ namespace pipeann {
    *      Support for Static Index Building and Searching
    **************************************************************/
 
-  /* This function finds out the navigating node, which is the medoid node
-   * in the graph.
-   */
   template<typename T, typename TagT>
   unsigned Index<T, TagT>::calculate_entry_point() {
-    // allocate and init centroid
-    std::vector<float> center(_dim, 0.0f);
-
-    for (size_t i = 0; i < _nd; i++)
-      for (size_t j = 0; j < _dim; j++)
-        center[j] += (float) _data[i * _dim + j];
-
-    for (auto &c : center)
-      c /= (float) _nd;
-
-    // compute all to one distance, updating the atomic variables should not be the bottleneck.
-    constexpr uint64_t kDistNum = 256;
-    struct alignas(64) AtomicDistance {
-      unsigned idx = 0;
-      float dist = std::numeric_limits<float>::max();
-      std::mutex lk;
-
-      void update(unsigned i, float d) {
-        std::lock_guard<std::mutex> guard(lk);
-        if (d < dist) {
-          dist = d;
-          idx = i;
-        }
-      }
-    };
-    AtomicDistance atomic_dists[kDistNum];
-
-#pragma omp parallel for schedule(static, 65536)
-    for (int64_t i = 0; i < (int64_t) _nd; i++) {
-      // extract point and distance reference
-      float dist = 0;
-      const T *cur_vec = _data.data() + (i * _dim);
-      for (size_t j = 0; j < _dim; j++) {
-        dist += (center[j] - (float) cur_vec[j]) * (center[j] - (float) cur_vec[j]);
-      }
-      atomic_dists[(i / 65536) % kDistNum].update(i, dist);
-    }
-
-    unsigned min_idx = 0;
-    float min_dist = std::numeric_limits<float>::max();
-    for (unsigned i = 0; i < kDistNum; i++) {
-      if (atomic_dists[i].dist < min_dist) {
-        min_idx = atomic_dists[i].idx;
-        min_dist = atomic_dists[i].dist;
-      }
-    }
-    return min_idx;
+    // Fixed seed keeps graph builds reproducible without scanning the vectors.
+    std::mt19937 rng(42);
+    return std::uniform_int_distribution<unsigned>(0, _nd - 1)(rng);
   }
 
   /* iterate_to_fixed_point():
-   * node_coords : point whose neighbors to be found.
-   * init_ids : ids of initial search list.
+   * query : RAW vector or RaBitQ8 code, prepared by the caller.
+   * ep : entry point of the search.
    * Lsize : size of list.
-   * beam_width: beam_width when performing indexing
    * expanded_nodes_info: will contain all the node ids and distances from
    * query that are expanded
-   * expanded_nodes_ids : will contain all the nodes that are expanded during
-   * search.
    * best_L_nodes: ids of closest L nodes in list
    */
   template<typename T, typename TagT>
-  std::pair<uint32_t, uint32_t> Index<T, TagT>::iterate_to_fixed_point(const T *node_coords, const unsigned Lsize,
-                                                                       const std::vector<unsigned> &init_ids,
+  std::pair<uint32_t, uint32_t> Index<T, TagT>::iterate_to_fixed_point(const uint8_t *query, const unsigned Lsize,
+                                                                       const unsigned ep,
                                                                        std::vector<Neighbor> &expanded_nodes_info,
-                                                                       tsl::robin_set<unsigned> &expanded_nodes_ids,
                                                                        std::vector<Neighbor> &best_L_nodes,
                                                                        QueryStats *stats) {
     expanded_nodes_info.reserve(10 * Lsize);
-    expanded_nodes_ids.reserve(10 * Lsize);
+    // Search/insert callers prevent storage growth; builds allocate up front.
+    const uint8_t *vector_data = _vectors->data();
+    const size_t vector_bytes = _vectors->data_size;
 
-    tsl::robin_set<unsigned> inserted_into_pool;
-    inserted_into_pool.reserve(Lsize * 20);
+    // Reuse one table per worker; clear retains its allocation between traversals.
+    FlatVisitedSet inserted_into_pool;
 
     CandidatePool pool(Lsize, Lsize + 1);
-    for (auto id : init_ids) {
-      assert(id < max_points());
-      if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
-        inserted_into_pool.insert(id);
-        pool.insert(Neighbor(id, _distance->compare(_data.data() + _dim * (size_t) id, node_coords, _dim)));
-      }
-    }
+    inserted_into_pool.insert(ep);
+    float entry_distance;
+    _vectors->compute_dists_sym(query, &ep, 1, &entry_distance);
+    pool.insert(Neighbor(ep, entry_distance));
 
     Timer query_timer, io_timer, cpu_timer;
     uint32_t hops = 0;
     uint32_t cmps = 0;
 
+    std::vector<unsigned> des;
+    std::vector<float> distances;
     Neighbor *cur;
     while ((cur = pool.next_unvisited()) != nullptr) {
       ++hops;
-      io_timer.reset();
+      if (stats != nullptr)
+        io_timer.reset();
       auto n = cur->id;
       expanded_nodes_info.emplace_back(*cur);
-      expanded_nodes_ids.insert(n);
-      std::vector<unsigned> des;
+      des.clear();
 
       {
         // pipeann::SparseReadLockGuard<uint64_t> guard(&_locks, n);
@@ -174,38 +129,32 @@ namespace pipeann {
             LOG(ERROR) << "Wrong id found: " << _final_graph[n][m];
             crash();
           }
-          des.emplace_back(_final_graph[n][m]);
+          const auto id = _final_graph[n][m];
+          if (inserted_into_pool.insert(id)) {
+            des.emplace_back(id);
+            prefetch_vector(reinterpret_cast<const char *>(vector_data + size_t(id) * vector_bytes), vector_bytes);
+          }
         }
       }
       if (stats != nullptr) {
-        stats->io_us += io_timer.elapsed();  // read vec
+        stats->io_us += io_timer.elapsed();  // collect unseen neighbors
       }
 
-      cpu_timer.reset();
+      if (stats != nullptr)
+        cpu_timer.reset();
 
-      for (unsigned m = 0; m < des.size(); ++m) {
-        unsigned id = des[m];
-        if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
-          inserted_into_pool.insert(id);
-
-          if ((m + 1) < des.size()) {
-            auto nextn = des[m + 1];
-            pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
-          }
-          cmps++;
-
-          float dist = _distance->compare(node_coords, _data.data() + _dim * (size_t) id, (unsigned) _dim);
-
-          pool.insert(Neighbor(id, dist));
-        }
-      }
+      distances.resize(des.size());
+      _vectors->compute_dists_sym(query, des.data(), des.size(), distances.data());
+      cmps += des.size();
+      // The visited set guarantees unique IDs within and across batches.
+      pool.insert_batch(des.data(), distances.data(), des.size());
       if (stats != nullptr) {
         stats->cpu_us += cpu_timer.elapsed();  // compute + read nbr
       }
     }
 
-    best_L_nodes.resize(Lsize + 1);
-    for (unsigned i = 0; i < Lsize + 1; ++i) {
+    best_L_nodes.resize(std::min<size_t>(Lsize, pool.size()));
+    for (size_t i = 0; i < best_L_nodes.size(); ++i) {
       best_L_nodes[i] = pool[i];
     }
     return std::make_pair(hops, cmps);
@@ -214,11 +163,10 @@ namespace pipeann {
   template<typename T, typename TagT>
   void Index<T, TagT>::get_expanded_nodes(const size_t node_id, const unsigned Lindex,
                                           std::vector<Neighbor> &expanded_nodes_info) {
-    const T *node_coords = _data.data() + _dim * node_id;
-    std::vector<unsigned> init_ids{_ep};
     std::vector<Neighbor> best_L_nodes;
-    tsl::robin_set<unsigned> expanded_nodes_ids;
-    iterate_to_fixed_point(node_coords, Lindex, init_ids, expanded_nodes_info, expanded_nodes_ids, best_L_nodes);
+    // Build has fixed storage; insert_point holds _update_lock against resize.
+    const uint8_t *node_coords = _vectors->at(node_id);
+    iterate_to_fixed_point(node_coords, Lindex, _ep, expanded_nodes_info, best_L_nodes);
   }
 
   /* inter_insert():
@@ -259,17 +207,16 @@ namespace pipeann {
         std::vector<Neighbor> pool;
         pool.reserve(copy_of_neighbors.size());
 
-        for (auto cur_nbr : copy_of_neighbors) {
-          if (cur_nbr != des) {
-            float dist =
-                _distance->compare(_data.data() + _dim * (size_t) des, _data.data() + _dim * (size_t) cur_nbr, _dim);
-            pool.emplace_back(Neighbor(cur_nbr, dist));
-          }
+        std::vector<float> distances(copy_of_neighbors.size());
+        _vectors->compute_dists(des, copy_of_neighbors.data(), copy_of_neighbors.size(), distances.data());
+        for (size_t i = 0; i < copy_of_neighbors.size(); ++i) {
+          if (copy_of_neighbors[i] != des)
+            pool.emplace_back(copy_of_neighbors[i], distances[i]);
         }
         std::vector<unsigned> new_out_neighbors;
-        pipeann::prune_neighbors(pool, new_out_neighbors, params, _dist_metric, [this](uint32_t a, uint32_t b) {
-          return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-        });
+        pipeann::prune_neighbors(
+            pool, new_out_neighbors, params, _dist_metric,
+            [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
         {
           // pipeann::SparseWriteLockGuard<uint64_t> guard(&_locks, des);
           pipeann::LockGuard guard(_locks->wrlock(des));
@@ -292,9 +239,6 @@ namespace pipeann {
     int64_t n_vecs_to_visit = _nd;
     _ep = calculate_entry_point();
 
-    std::vector<unsigned> init_ids;
-    init_ids.emplace_back(_ep);
-
     pipeann::Timer link_timer;
 #pragma omp parallel for schedule(dynamic)
     for (int64_t node = 0; node < n_vecs_to_visit; node++) {
@@ -308,9 +252,9 @@ namespace pipeann {
 
       // prune neighbors.
       std::vector<unsigned> pruned_list;
-      pipeann::prune_neighbors(pool, pruned_list, params, _dist_metric, [this](uint32_t a, uint32_t b) {
-        return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-      });
+      pipeann::prune_neighbors(
+          pool, pruned_list, params, _dist_metric,
+          [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
 
       {
         pipeann::LockGuard guard(_locks->wrlock(node));
@@ -343,16 +287,17 @@ namespace pipeann {
         std::vector<Neighbor> pool;
         std::vector<unsigned> new_out_neighbors;
 
-        for (auto cur_nbr : _final_graph[node]) {
-          if (cur_nbr != node) {
-            float dist =
-                _distance->compare(_data.data() + _dim * (size_t) node, _data.data() + _dim * (size_t) cur_nbr, _dim);
-            pool.emplace_back(Neighbor(cur_nbr, dist));
-          }
+        const auto &neighbors = _final_graph[node];
+        pool.reserve(neighbors.size());
+        std::vector<float> distances(neighbors.size());
+        _vectors->compute_dists(node, neighbors.data(), neighbors.size(), distances.data());
+        for (size_t i = 0; i < neighbors.size(); ++i) {
+          if (neighbors[i] != node)
+            pool.emplace_back(neighbors[i], distances[i]);
         }
-        pipeann::prune_neighbors(pool, new_out_neighbors, params, _dist_metric, [this](uint32_t a, uint32_t b) {
-          return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-        });
+        pipeann::prune_neighbors(
+            pool, new_out_neighbors, params, _dist_metric,
+            [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
 
         _final_graph[node].clear();
         for (auto id : new_out_neighbors)
@@ -362,46 +307,13 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  void Index<T, TagT>::build(const char *filename, const size_t num_points_to_load, IndexBuildParameters &params,
-                             const std::vector<TagT> &tags, bool normalize_cosine, const std::string &train_query_path,
-                             uint32_t R_ood, uint32_t L_ood) {
-    if (filename == nullptr || !file_exists(filename)) {
-      LOG(ERROR) << "Data file " << filename << " does not exist. Exiting....";
-      return;
-    }
-
-    LOG(INFO) << "Building index with normalize_cosine: " << normalize_cosine;
-
-    size_t file_num_points, file_dim;
-    pipeann::load_bin<T>(filename, _data, file_num_points, file_dim);
-
-    if (num_points_to_load > file_num_points) {
-      LOG(ERROR) << "ERROR: Driver requests loading " << num_points_to_load << " points but file has "
-                 << file_num_points << " points.";
-      crash();
-    }
-    if (file_dim != _dim) {
-      LOG(ERROR) << "ERROR: Driver requests loading " << _dim << " dimension,"
-                 << "but file has " << file_dim << " dimension.";
-      crash();
-    }
-
-    _final_graph.resize(file_num_points);
-
-    if (normalize_cosine && _dist_metric == Metric::COSINE) {
-      for (size_t i = 0; i < file_num_points; i++) {
-        pipeann::normalize_data(_data.data() + i * _dim, _data.data() + i * _dim, _dim);
-      }
-    }
-
-    LOG(INFO) << "Loading only first " << num_points_to_load << " from file.. ";
-    _nd = num_points_to_load;
-
-    if (tags.size() != num_points_to_load) {
-      LOG(ERROR) << "ERROR: Driver requests loading " << num_points_to_load << " points from file,"
-                 << "but tags vector is of size " << tags.size() << ".";
-      crash();
-    }
+  void Index<T, TagT>::build(IndexBuildParameters &params, const std::vector<TagT> &tags,
+                             const std::string &train_query_path, uint32_t R_ood, uint32_t L_ood) {
+    if (params.num_threads)
+      omp_set_num_threads(params.num_threads);
+    LOG(INFO) << "Connecting " << _nd << " points.";
+    if (tags.size() != _nd)
+      throw std::invalid_argument("Tag count does not match vector file point count");
     for (size_t i = 0; i < tags.size(); ++i) {
       _tag_to_location[tags[i]] = (unsigned) i;
       _location_to_tag[(unsigned) i] = tags[i];
@@ -443,22 +355,15 @@ namespace pipeann {
                 << " min:" << min_deg << " count(deg<2):" << cnt;
     }
     range = std::max(range, (uint16_t) max_deg);
-
-    // Initialize empty slots for future insertions
-    for (uint32_t i = _nd; i < max_points(); i++) {
-      _empty_slots.insert(i);
-    }
   }
 
   template<typename T, typename TagT>
-  void Index<T, TagT>::build(const char *filename, const size_t num_points_to_load, IndexBuildParameters &params,
-                             const char *tag_filename, bool normalize_cosine, const std::string &train_query_path,
-                             uint32_t R_ood, uint32_t L_ood) {
+  void Index<T, TagT>::build(IndexBuildParameters &params, const char *tag_filename,
+                             const std::string &train_query_path, uint32_t R_ood, uint32_t L_ood) {
     std::vector<TagT> tags{};
 
     if (tag_filename == nullptr) {
-      // Generate default tags
-      tags.resize(num_points_to_load);
+      tags.resize(_nd);
       std::iota(tags.begin(), tags.end(), TagT{0});
     } else {
       if (!file_exists(tag_filename)) {
@@ -468,146 +373,90 @@ namespace pipeann {
       LOG(INFO) << "Loading tags from " << tag_filename << " for vamana index build";
       size_t npts, ndim;
       pipeann::load_bin(tag_filename, tags, npts, ndim);
-      if (npts != num_points_to_load) {
-        std::stringstream sstream;
-        sstream << "Loaded " << npts << " tags instead of expected number: " << num_points_to_load;
-        LOG(ERROR) << sstream.str();
-        crash();
-      }
+      if (ndim != 1)
+        throw std::invalid_argument("Tag file must have one column");
     }
 
-    build(filename, num_points_to_load, params, tags, normalize_cosine, train_query_path, R_ood, L_ood);
+    build(params, tags, train_query_path, R_ood, L_ood);
+  }
+
+  template<typename T, typename TagT>
+  std::vector<uint8_t> Index<T, TagT>::prepare_record(const T *query) {
+    std::vector<uint8_t> record(_vectors->data_size);
+    if (_dist_metric == COSINE) {
+      std::vector<T> normalized(_dim);
+      normalize_data(normalized.data(), query, _dim);
+      _vectors->encode(normalized.data(), record.data());
+    } else {
+      _vectors->encode(query, record.data());
+    }
+    return record;
   }
 
   template<typename T, typename TagT>
   std::pair<uint32_t, uint32_t> Index<T, TagT>::search(const T *query, const size_t K, const unsigned L,
                                                        unsigned *indices, float *distances, QueryStats *stats,
                                                        const std::vector<uint32_t> *cand_ids) {
-    std::vector<unsigned> init_ids;
-    tsl::robin_set<unsigned> visited(10 * L);
-    std::vector<Neighbor> best_L_nodes, expanded_nodes_info;
-    tsl::robin_set<unsigned> expanded_nodes_ids;
-
     std::shared_lock<std::shared_timed_mutex> lock(_update_lock);
-
-    if (init_ids.size() == 0) {
-      init_ids.emplace_back(_ep);
+    if (K == 0 || L == 0) return {0, 0};
+    const auto prepared = prepare_record(query);
+    std::vector<Neighbor> results;
+    const auto work = search_prepared(prepared.data(), L, results, stats, cand_ids);
+    const size_t count = std::min(K, results.size());
+    for (size_t i = 0; i < count; ++i) {
+      indices[i] = results[i].id;
+      if (distances) distances[i] = results[i].distance;
     }
-    T *aligned_query;
-    size_t allocSize = _dim * sizeof(T);
-    alloc_aligned(((void **) &aligned_query), allocSize, 8 * sizeof(T));
-    memset(aligned_query, 0, _dim * sizeof(T));
-    if (_dist_metric == pipeann::Metric::COSINE) {
-      pipeann::normalize_data(aligned_query, query, _dim);
-    } else {
-      memcpy(aligned_query, query, _dim * sizeof(T));
-    }
-    std::pair<uint32_t, uint32_t> retval{0, 0};
+    std::fill(indices + count, indices + K, kInvalidID);
+    if (distances)
+      std::fill(distances + count, distances + K, std::numeric_limits<float>::max());
+    return work;
+  }
 
+  template<typename T, typename TagT>
+  std::pair<uint32_t, uint32_t> Index<T, TagT>::search_prepared(const uint8_t *prepared_query, unsigned L,
+                                                            std::vector<Neighbor> &results, QueryStats *stats,
+                                                            const std::vector<uint32_t> *cand_ids) {
+    results.clear();
+    std::pair<uint32_t, uint32_t> work{0, 0};
     if (cand_ids != nullptr) {
-      best_L_nodes.reserve(cand_ids->size());
-      for (auto loc : *cand_ids) {
-        best_L_nodes.emplace_back(loc, _distance->compare(aligned_query, _data.data() + (size_t) loc * _dim, _dim));
-      }
-      std::sort(best_L_nodes.begin(), best_L_nodes.end());
-      retval.second = (uint32_t) best_L_nodes.size();
+      results.reserve(cand_ids->size());
+      std::vector<float> distances(cand_ids->size());
+      _vectors->compute_dists_sym(prepared_query, cand_ids->data(), cand_ids->size(), distances.data());
+      for (size_t i = 0; i < cand_ids->size(); ++i)
+        results.emplace_back((*cand_ids)[i], distances[i]);
+      std::sort(results.begin(), results.end());
+      work.second = static_cast<uint32_t>(results.size());
     } else {
-      retval = iterate_to_fixed_point(aligned_query, L, init_ids, expanded_nodes_info, expanded_nodes_ids,
-                                      best_L_nodes, stats);
+      std::vector<Neighbor> expanded;
+      work = iterate_to_fixed_point(prepared_query, L, _ep, expanded, results, stats);
     }
-
-    size_t pos = 0;
-    for (auto it : best_L_nodes) {
-      if (it.id < max_points()) {
-        indices[pos] = it.id;
-        if (distances != nullptr)
-          distances[pos] = it.distance;
-        pos++;
-      }
-      if (pos == K)
-        break;
+    if (stats) {
+      stats->n_hops = work.first;
+      stats->n_cmps = work.second;
     }
-    for (size_t i = pos; i < K; i++) {
-      indices[i] = std::numeric_limits<unsigned>::max();
-      if (distances != nullptr) {
-        distances[i] = std::numeric_limits<float>::max();
-      }
-    }
-
-    if (stats != nullptr) {
-      stats->n_hops = retval.first;
-      stats->n_cmps = retval.second;
-    }
-    aligned_free(aligned_query);
-    return retval;
+    return work;
   }
 
   template<typename T, typename TagT>
   size_t Index<T, TagT>::search_with_tags(const T *query, const size_t K, const unsigned L, TagT *tags,
-                                          float *distances, const std::vector<uint32_t> *cand_ids) {
-    uint32_t *indices = new unsigned[L];
-    float *dist_interim = new float[L];
-    search(query, L, L, indices, dist_interim, nullptr, cand_ids);
-
+                                        float *distances, const std::vector<uint32_t> *cand_ids) {
     std::shared_lock<std::shared_timed_mutex> ulock(_update_lock);
+    if (K == 0 || L == 0) return 0;
+    const auto prepared = prepare_record(query);
+    std::vector<Neighbor> results;
+    search_prepared(prepared.data(), L, results, nullptr, cand_ids);
+
     std::shared_lock<std::shared_timed_mutex> lock(_tag_lock);
-    size_t pos = 0;
-    for (int i = 0; i < (int) L; ++i) {
-      if (_location_to_tag.find(indices[i]) != _location_to_tag.end()) {
-        tags[pos] = _location_to_tag[indices[i]];
-        if (distances != nullptr)
-          distances[pos] = dist_interim[i];
-        pos++;
-        if (pos == K)
-          break;
-      }
+    size_t count = 0;
+    for (const auto &result : results) {
+      auto it = _location_to_tag.find(result.id);
+      if (it == _location_to_tag.end()) continue;
+      tags[count] = it->second;
+      if (distances) distances[count] = result.distance;
+      if (++count == K) break;
     }
-    delete[] indices;
-    delete[] dist_interim;
-    return pos;
-  }
-
-  template<typename T, typename TagT>
-  uint32_t Index<T, TagT>::search_with_tags_fast(const T *normalized_query, const unsigned Lsize, TagT *tags,
-                                                 float *dists) {
-    CandidatePool pool(Lsize, Lsize + 1);
-
-    tsl::robin_set<unsigned> inserted_into_pool;
-    inserted_into_pool.reserve(Lsize * 20);
-
-    auto ep = _ep;
-    inserted_into_pool.insert(ep);
-    pool.insert(Neighbor(ep, _distance->compare(_data.data() + _dim * (size_t) ep, normalized_query, _dim)));
-
-    unsigned cmps = 0;
-
-    Neighbor *cur;
-    while ((cur = pool.next_unvisited()) != nullptr) {
-      auto n = cur->id;
-
-      auto &cur_v = _final_graph[n];
-      for (unsigned m = 0; m < cur_v.size(); ++m) {
-        unsigned id = cur_v[m];
-        if (inserted_into_pool.find(id) == inserted_into_pool.end()) {
-          inserted_into_pool.insert(id);
-
-          if ((m + 1) < cur_v.size()) {
-            auto nextn = cur_v[m + 1];
-            pipeann::prefetch_vector((const char *) _data.data() + _dim * (size_t) nextn, sizeof(T) * _dim);
-          }
-
-          float dist = _distance->compare(normalized_query, _data.data() + _dim * (size_t) id, (unsigned) _dim);
-          cmps++;
-
-          pool.insert(Neighbor(id, dist));
-        }
-      }
-    }
-    for (uint32_t i = 0; i < Lsize; ++i) {
-      tags[i] = _location_to_tag[pool[i].id];
-      dists[i] = pool[i].distance;
-    }
-    return cmps;
+    return count;
   }
 
   template<typename T, typename TagT>
@@ -642,10 +491,6 @@ namespace pipeann {
     }
     LOG(INFO) << "After consolidation, new_nd: " << new_nd;
 
-    // Save old ep vector for finding new ep later
-    std::vector<T> ep_vector(_dim);
-    memcpy(ep_vector.data(), _data.data() + _dim * _ep, _dim * sizeof(T));
-
     // Step 2: Update neighbor lists (parallel) then compact (sequential).
 #pragma omp parallel for schedule(dynamic, 1024)
     for (int64_t old_id = 0; old_id < (int64_t) max_points(); ++old_id) {
@@ -673,13 +518,13 @@ namespace pipeann {
       if (new_nbrs.size() > params.R) {
         std::vector<Neighbor> pool;
         pool.reserve(new_nbrs.size());
-        for (auto nbr : new_nbrs) {
-          float dist = _distance->compare(_data.data() + _dim * old_id, _data.data() + _dim * nbr, _dim);
-          pool.emplace_back(nbr, dist);
-        }
-        pipeann::prune_neighbors(pool, new_nbrs, params, _dist_metric, [this](uint32_t a, uint32_t b) {
-          return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-        });
+        std::vector<float> distances(new_nbrs.size());
+        _vectors->compute_dists(old_id, new_nbrs.data(), new_nbrs.size(), distances.data());
+        for (size_t i = 0; i < new_nbrs.size(); ++i)
+          pool.emplace_back(new_nbrs[i], distances[i]);
+        pipeann::prune_neighbors(
+            pool, new_nbrs, params, _dist_metric,
+            [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
       }
 
       // Remap neighbor IDs to new IDs
@@ -698,7 +543,7 @@ namespace pipeann {
       }
 
       _final_graph[new_id] = std::move(_final_graph[old_id]);
-      memcpy(_data.data() + _dim * new_id, _data.data() + _dim * old_id, _dim * sizeof(T));
+      memmove(_vectors->at(new_id), _vectors->at(old_id), _vectors->data_size);
     }
 
     // Clear graph entries beyond new_nd
@@ -720,23 +565,17 @@ namespace pipeann {
     _location_to_tag = std::move(new_location_to_tag);
 
     _nd = new_nd;
+    _vectors->npoints = _nd;
     _delete_set.clear();
-    _empty_slots.clear();
-    for (uint32_t i = _nd; i < max_points(); ++i) {
-      _empty_slots.insert(i);
-    }
 
-    // Step 4: After everything finishes, find new entry point.
-    float min_dist = std::numeric_limits<float>::max();
-    this->search(ep_vector.data(), 1, 10, &_ep, &min_dist);
+    // Preserve a surviving entry point; otherwise select a remaining node.
+    _ep = id_map[_ep] != kInvalidID ? id_map[_ep] : calculate_entry_point();
 
     auto stop = std::chrono::high_resolution_clock::now();
     LOG(INFO) << "Consolidation completed in "
               << std::chrono::duration_cast<std::chrono::duration<double>>(stop - start).count() << "s.";
   }
 
-  // Do not call reserve_location() if you have not locked _change_lock.
-  // It is not thread safe.
   template<typename T, typename TagT>
   uint32_t Index<T, TagT>::reserve_location() {
     std::lock_guard<std::mutex> guard(_change_lock);
@@ -744,15 +583,8 @@ namespace pipeann {
       return kInvalidID;
     }
 
-    assert(!_empty_slots.empty());
-    assert(_empty_slots.size() + _nd == max_points());
-
-    auto iter = _empty_slots.begin();
-    unsigned location = *iter;
-    _empty_slots.erase(iter);
-    _delete_set.erase(location);
-
-    ++_nd;
+    const uint32_t location = static_cast<uint32_t>(_nd);
+    _vectors->npoints = ++_nd;
     return location;
   }
 
@@ -760,15 +592,10 @@ namespace pipeann {
   void Index<T, TagT>::resize(size_t new_max_points) {
     new_max_points = std::max(new_max_points, 50000ul);  // at least 50000 points.
     auto start = std::chrono::high_resolution_clock::now();
-    assert(_empty_slots.size() == 0);  // should not resize if there are empty slots.
 
     LOG(INFO) << "Resize from " << max_points() << " to " << new_max_points;
-    _data.resize(new_max_points * _dim);
+    _vectors->reserve(new_max_points);
     _final_graph.resize(new_max_points);
-
-    for (size_t i = _nd; i < max_points(); i++) {
-      _empty_slots.insert(i);
-    }
 
     auto stop = std::chrono::high_resolution_clock::now();
   }
@@ -847,13 +674,8 @@ namespace pipeann {
       _location_to_tag[location] = tag;
     }
 
-    auto offset_data = _data.data() + _dim * location;
-    memset((void *) offset_data, 0, sizeof(T) * _dim);
-    if (_dist_metric == pipeann::Metric::COSINE) {
-      pipeann::normalize_data(offset_data, point, _dim);
-    } else {
-      memcpy((void *) offset_data, point, sizeof(T) * _dim);
-    }
+    const auto record = prepare_record(point);
+    memcpy(_vectors->at(location), record.data(), _vectors->data_size);
 
     std::vector<Neighbor> pool;
     get_expanded_nodes(location, params.L, pool);
@@ -862,9 +684,9 @@ namespace pipeann {
                pool.end());
 
     std::vector<unsigned> pruned_list;
-    pipeann::prune_neighbors(pool, pruned_list, params, _dist_metric, [this](uint32_t a, uint32_t b) {
-      return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-    });
+    pipeann::prune_neighbors(
+        pool, pruned_list, params, _dist_metric,
+        [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
     assert(_final_graph.size() == max_points());
 
     _final_graph[location].clear();
@@ -875,7 +697,7 @@ namespace pipeann {
                 << " pruned_list.size(): " << pruned_list.size();
     }
 
-    assert(!pruned_list.empty());
+    assert(_nd == 1 || !pruned_list.empty());
     {
       // pipeann::SparseWriteLockGuard<uint64_t> guard(&_locks, location);
       pipeann::LockGuard guard(_locks->wrlock(location));
@@ -1011,7 +833,7 @@ namespace pipeann {
 
   // getDefectsFixingEdges: sort unreachable (i,j) pairs by dist, greedily add minimum set.
   template<typename T, typename TagT>
-  void Index<T, TagT>::ngfix_pass(const T *query, const unsigned *gt, size_t Nq, size_t Kh) {
+  void Index<T, TagT>::ngfix_pass(const unsigned *gt, size_t Nq, size_t Kh) {
     if (Nq > NGFIX_MAX_NQ)
       return;
     std::vector<std::vector<uint16_t>> H;
@@ -1031,12 +853,12 @@ namespace pipeann {
     };
     std::vector<Cand> vs;
     vs.reserve(Nq * Nq);
-    for (size_t i = 0; i < Nq; i++) {
-      for (size_t j = 0; j < Nq; j++) {
-        if (f[i][j])
-          continue;
-        float d = _distance->compare(_data.data() + _dim * (size_t) gt[i], _data.data() + _dim * (size_t) gt[j], _dim);
-        vs.push_back({d, (uint16_t) i, (uint16_t) j});
+    for (size_t i = 0; i < Nq; ++i) {
+      for (size_t j = 0; j < Nq; ++j) {
+        if (f[i][j]) continue;
+        float distance;
+        _vectors->compute_dists(gt[i], gt + j, 1, &distance);
+        vs.push_back({distance, static_cast<uint16_t>(i), static_cast<uint16_t>(j)});
       }
     }
     std::sort(vs.begin(), vs.end(), [](const Cand &a, const Cand &b) { return a.d < b.d; });
@@ -1063,28 +885,27 @@ namespace pipeann {
 
   // RFix: single round. If ANN can't reach gt[Nq-1], add heuristic-pruned closer points as refine edges.
   template<typename T, typename TagT>
-  void Index<T, TagT>::rfix_pass(const T *query, const unsigned *gt, size_t Nq, uint32_t L_ood) {
-    std::vector<unsigned> ids(L_ood);
-    std::vector<float> dists(L_ood);
-    search(query, 1, Nq, ids.data(), dists.data());
-    float d2 = _distance->compare(_data.data() + _dim * (size_t) gt[Nq - 1], query, _dim);
-    if (dists[0] <= d2)
-      return;
+  void Index<T, TagT>::rfix_pass(const uint8_t *prepared_query, const unsigned *gt, size_t Nq, uint32_t L_ood) {
+    std::vector<Neighbor> results;
+    search_prepared(prepared_query, Nq, results);
+    if (results.empty()) return;
+    float d2;
+    _vectors->compute_dists_sym(prepared_query, gt + Nq - 1, 1, &d2);
+    if (results[0].distance <= d2) return;
 
-    unsigned ANN = ids[0];
-    search(query, L_ood, L_ood, ids.data(), dists.data());
+    const unsigned ANN = results[0].id;
+    search_prepared(prepared_query, L_ood, results);
     std::vector<unsigned> res;
-    for (size_t i = 0; i < L_ood; i++) {
-      if (dists[i] < d2)
-        res.push_back(ids[i]);
+    for (const auto &result : results) {
+      if (result.distance < d2) res.push_back(result.id);
     }
 
     std::vector<Neighbor> pool;
     pool.reserve(res.size());
-    for (unsigned v : res) {
-      float d = _distance->compare(_data.data() + _dim * (size_t) ANN, _data.data() + _dim * (size_t) v, _dim);
-      pool.emplace_back(Neighbor(v, d));
-    }
+    std::vector<float> distances(res.size());
+    _vectors->compute_dists(ANN, res.data(), res.size(), distances.data());
+    for (size_t i = 0; i < res.size(); ++i)
+      pool.emplace_back(res[i], distances[i]);
 
     IndexBuildParameters rfix_params;
     rfix_params.R = 6;  // default in NGFix.
@@ -1093,9 +914,9 @@ namespace pipeann {
     rfix_params.saturate_graph = false;
 
     std::vector<unsigned> picked;
-    pipeann::prune_neighbors(pool, picked, rfix_params, _dist_metric, [this](uint32_t a, uint32_t b) {
-      return _distance->compare(_data.data() + _dim * a, _data.data() + _dim * b, _dim);
-    });
+    pipeann::prune_neighbors(
+        pool, picked, rfix_params, _dist_metric,
+        [this](uint32_t a, const uint32_t *ids, size_t n, float *out) { _vectors->compute_dists(a, ids, n, out); });
 
     // RFix edges use EH=MAX_S+1 (just above ordinary hardness range, below EH_INF).
     const uint16_t rfix_eh = (uint16_t) (NGFIX_MAX_S + 1);
@@ -1107,7 +928,7 @@ namespace pipeann {
   void Index<T, TagT>::ngfix_refine(const std::string &train_query_path, uint32_t L_ood) {
     // Too small L_ood won't find enough neighbors for refine.
     L_ood = std::max<uint32_t>(L_ood, NGFIX_MAX_S);
-    
+
     // Load training queries.
     std::vector<T> train_data;
     size_t train_n = 0, train_dim = 0;
@@ -1126,15 +947,20 @@ namespace pipeann {
     pipeann::Timer refine_timer;
 #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < train_n; i++) {
-      const T *q = train_data.data() + i * _dim;
+      std::shared_lock<std::shared_timed_mutex> lock(_update_lock);
+      const auto query = prepare_record(train_data.data() + i * _dim);
       // AKNN ground truth (top-500 via beam L_ood, NGFix default)
-      std::vector<unsigned> ids(std::min<size_t>(500, L_ood));
-      search(q, ids.size(), L_ood, ids.data());
-      // Coarse + fine NGFix passes, then RFix.
-      // use this->R_base and this->R_ood.
-      ngfix_pass(q, ids.data(), /*Nq=*/100, /*Kh=*/100);
-      ngfix_pass(q, ids.data(), /*Nq=*/10, /*Kh=*/10);
-      rfix_pass(q, ids.data(), /*Nq=*/10, L_ood);
+      std::vector<Neighbor> results;
+      search_prepared(query.data(), L_ood, results);
+      std::vector<unsigned> ids;
+      for (size_t j = 0; j < std::min<size_t>(500, results.size()); ++j)
+        ids.push_back(results[j].id);
+      // Hardness needs up to 2 * Nq neighbors; small graphs may return fewer.
+      const size_t coarse_nq = std::min<size_t>(100, ids.size() / 2);
+      const size_t fine_nq = std::min<size_t>(10, ids.size() / 2);
+      ngfix_pass(ids.data(), coarse_nq, coarse_nq);
+      ngfix_pass(ids.data(), fine_nq, fine_nq);
+      if (!ids.empty()) rfix_pass(query.data(), ids.data(), std::min<size_t>(10, ids.size()), L_ood);
 
       if (i % 100000 == 0) {
         LOG(INFO) << "NGFix refine: processed " << i << "/" << train_n;

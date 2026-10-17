@@ -18,8 +18,8 @@ namespace pipeann {
     float *all_to_all_dists = nullptr;
     pipeann::Metric metric;
 
-    uint64_t ndims;  // ndims = chunk_size * n_chunks
-    uint64_t n_chunks;
+    uint64_t ndims = 0;  // ndims = chunk_size * n_chunks
+    uint64_t n_chunks = 0;
 
     uint64_t all_to_all_dist_size() {
       return sizeof(float) * n_chunks * NUM_PQ_CENTROIDS * NUM_PQ_CENTROIDS;
@@ -30,6 +30,7 @@ namespace pipeann {
 
     FixedChunkPQTable &operator=(FixedChunkPQTable &&other) noexcept {
       if (this != &other) {
+        destroy_table();
         this->ndims = other.ndims;
         this->n_chunks = other.n_chunks;
         this->tables = other.tables;
@@ -116,17 +117,17 @@ namespace pipeann {
 
       pipeann::load_bin_impl<uint32_t>(reader, chunk_offsets, nr, nc, file_offset_data[3] + offset);
 
-      if (nr != (uint64_t) num_chunks + 1 || nc != 1) {
+      if (nr < 2 || nc != 1 || (num_chunks != 0 && nr != (uint64_t) num_chunks + 1)) {
         LOG(ERROR) << "Chunk offsets: nr=" << nr << ", nc=" << nc << ", expecting nr=" << num_chunks + 1 << ", nc=1.";
         crash();
       }
 
-      this->n_chunks = num_chunks;
+      this->n_chunks = nr - 1;
       LOG(INFO) << "Loaded PQ Pivots: #centroids: " << NUM_PQ_CENTROIDS << ", #dims: " << this->ndims
                 << ", #chunks: " << this->n_chunks;
     }
 
-    void save_pq_pivots(const char *pq_pivots_path) {
+    void save_pq_pivots(const char *pq_pivots_path) const {
       // Create dummy identity rearrangement for backward compatibility
       std::vector<uint32_t> dummy_rearrangement(this->ndims);
       for (uint32_t d = 0; d < this->ndims; d++) {
@@ -185,7 +186,9 @@ namespace pipeann {
       }
     }
 
-    void load_pq_centroid_bin(const char *pq_table_file, size_t num_chunks, size_t offset = 0) {
+    // A zero chunk count means infer it from the stored chunk offsets.
+    void load_pq_centroid_bin(const char *pq_table_file, size_t num_chunks = 0, size_t offset = 0) {
+      destroy_table();
       std::string pq_pivots_path(pq_table_file);
       uint64_t nr, nc;
       get_bin_metadata(pq_table_file, nr, nc, offset);
@@ -195,7 +198,7 @@ namespace pipeann {
       post_load_pq_table();
     }
 
-    void populate_chunk_distances_l2_scalar(const T *query_vec, float *dist_vec) {
+    void populate_chunk_distances_l2_scalar(const T *query_vec, float *dist_vec) const {
       memset(dist_vec, 0, 256 * n_chunks * sizeof(float));
       // chunk wise distance computation
       for (uint64_t chunk = 0; chunk < n_chunks; chunk++) {
@@ -213,7 +216,7 @@ namespace pipeann {
     }
 
     // For L2 and cosine distances, both converted to L2.
-    void populate_chunk_distances_l2(const T *query_vec, float *dist_vec) {
+    void populate_chunk_distances_l2(const T *query_vec, float *dist_vec) const {
 #ifdef USE_AVX512
       memset(dist_vec, 0, 256 * n_chunks * sizeof(float));
       // chunk wise distance computation
@@ -240,7 +243,7 @@ namespace pipeann {
 #endif
     }
 
-    void populate_chunk_distances_ip_scalar(const T *query_vec, float *dist_vec) {
+    void populate_chunk_distances_ip_scalar(const T *query_vec, float *dist_vec) const {
       std::memset(dist_vec, 0, 256 * n_chunks * sizeof(float));
 
       for (uint64_t chunk = 0; chunk < n_chunks; chunk++) {
@@ -257,7 +260,7 @@ namespace pipeann {
       }
     }
 
-    void populate_chunk_distances_ip(const T *query_vec, float *dist_vec) {
+    void populate_chunk_distances_ip(const T *query_vec, float *dist_vec) const {
 #ifdef USE_AVX512
       std::memset(dist_vec, 0, 256 * n_chunks * sizeof(float));
 
@@ -282,7 +285,7 @@ namespace pipeann {
 #endif
     }
 
-    void populate_chunk_distances(const T *query_vec, float *dist_vec) {
+    void populate_chunk_distances(const T *query_vec, float *dist_vec) const {
       if (metric == pipeann::Metric::INNER_PRODUCT) {
         populate_chunk_distances_ip(query_vec, dist_vec);
       } else {
@@ -290,24 +293,9 @@ namespace pipeann {
       }
     }
 
-    // computes PQ distance between comp_src and comp_dsts in efficient manner
-    // comp_src: [nchunks]
-    // comp_dsts: count * [nchunks]
-    // dists: [count]
-    void compute_distances_alltoall(const uint8_t *comp_src, const uint8_t *comp_dsts, float *dists,
-                                    const uint32_t count) {
-      std::memset(dists, 0, count * sizeof(float));
-      for (uint64_t i = 0; i < count; i++) {
-        for (uint64_t c = 0; c < n_chunks; c++) {
-          dists[i] += all_to_all_dists[(uint64_t) comp_src[c] * 256 * n_chunks +
-                                       (uint64_t) comp_dsts[i * n_chunks + c] * n_chunks + c];
-        }
-      }
-    }
-
     // fp_vec: [ndims]
     // out_pq_vec : [nchunks]
-    void deflate_vec(const float *fp_vec, uint8_t *out_pq_vec) {
+    void deflate_vec(const float *fp_vec, uint8_t *out_pq_vec) const {
       // No longer using rearrangement - dimensions are processed in natural order
       // Compute all distances to 256 centroids and choose the closest (for each chunk)
       for (uint32_t c = 0; c < n_chunks; c++) {
@@ -325,5 +313,85 @@ namespace pipeann {
         }
       }
     }
+    float compute_distance(const float *a, const uint8_t *b) const;
+    float compute_distance(const uint8_t *a, const uint8_t *b) const;
+    void compute_distances(const float *a, const uint8_t *b, const uint32_t *ids, size_t n,
+                           float *out, size_t data_size) const;
+    void compute_distances(const uint8_t *a, const uint8_t *b, const uint32_t *ids, size_t n,
+                           float *out, size_t data_size) const;
+
   };
+
+  namespace pq_table_detail {
+    inline constexpr size_t kPrefetchWindow = 16;
+
+    // Include the first cache line for short PQ codes and every crossed line
+    // for unaligned records, without reading beyond the code itself.
+    inline void prefetch_pq_code(const uint8_t *code, size_t bytes) {
+      if (!bytes) return;
+      cpu_prefetch_t0(code);
+      const uintptr_t end = reinterpret_cast<uintptr_t>(code) + bytes;
+      for (uintptr_t next = (reinterpret_cast<uintptr_t>(code) | uintptr_t(63)) + 1;
+           next < end; next += 64)
+        cpu_prefetch_t0(reinterpret_cast<const void *>(next));
+    }
+  }
+
+  template<typename T>
+  float FixedChunkPQTable<T>::compute_distance(const float *a, const uint8_t *b) const {
+    float result = 0;
+    for (size_t c = 0; c < n_chunks; ++c)
+      result += a[c * 256 + b[c]];
+    return result;
+  }
+
+  template<typename T>
+  float FixedChunkPQTable<T>::compute_distance(const uint8_t *a, const uint8_t *b) const {
+    float result = 0;
+    for (size_t c = 0; c < n_chunks; ++c)
+      result += all_to_all_dists[(size_t(a[c]) * 256 + b[c]) * n_chunks + c];
+    return result;
+  }
+
+  template<typename T>
+  void FixedChunkPQTable<T>::compute_distances(const float *a, const uint8_t *b, const uint32_t *ids, size_t n,
+                                               float *out, size_t data_size) const {
+    auto prefetch = [&](size_t i) { pq_table_detail::prefetch_pq_code(b + size_t(ids[i]) * data_size, n_chunks); };
+    for (size_t i = 0; i < std::min(pq_table_detail::kPrefetchWindow, n); ++i) prefetch(i);
+
+    // Keep four independent accumulators, but read codes directly by ID.
+    // Four avoids register spills and costly lane packing in the eight-point loop.
+    // Each point still accumulates chunks in order, preserving its result bits.
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+      for (size_t j = 0; j < 4 && i + pq_table_detail::kPrefetchWindow + j < n; ++j)
+        prefetch(i + pq_table_detail::kPrefetchWindow + j);
+      const uint8_t *p0 = b + size_t(ids[i]) * data_size;
+      const uint8_t *p1 = b + size_t(ids[i + 1]) * data_size;
+      const uint8_t *p2 = b + size_t(ids[i + 2]) * data_size;
+      const uint8_t *p3 = b + size_t(ids[i + 3]) * data_size;
+      float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+      for (size_t chunk = 0; chunk < n_chunks; ++chunk) {
+        const float *row = a + 256 * chunk;
+        a0 += row[p0[chunk]]; a1 += row[p1[chunk]];
+        a2 += row[p2[chunk]]; a3 += row[p3[chunk]];
+      }
+      out[i] = a0; out[i + 1] = a1; out[i + 2] = a2; out[i + 3] = a3;
+    }
+    for (; i < n; ++i) {
+      if (i + pq_table_detail::kPrefetchWindow < n) prefetch(i + pq_table_detail::kPrefetchWindow);
+      out[i] = compute_distance(a, b + size_t(ids[i]) * data_size);
+    }
+  }
+
+  template<typename T>
+  void FixedChunkPQTable<T>::compute_distances(const uint8_t *a, const uint8_t *b, const uint32_t *ids, size_t n,
+                                               float *out, size_t data_size) const {
+    auto prefetch = [&](size_t i) { pq_table_detail::prefetch_pq_code(b + size_t(ids[i]) * data_size, n_chunks); };
+    for (size_t i = 0; i < std::min(pq_table_detail::kPrefetchWindow, n); ++i) prefetch(i);
+    for (size_t i = 0; i < n; ++i) {
+      if (i + pq_table_detail::kPrefetchWindow < n) prefetch(i + pq_table_detail::kPrefetchWindow);
+      out[i] = compute_distance(a, b + size_t(ids[i]) * data_size);
+    }
+  }
 }  // namespace pipeann

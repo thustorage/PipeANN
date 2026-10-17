@@ -53,9 +53,6 @@ namespace pipeann {
     const T *query = query_buf->aligned_query<T>();
     query_buf->reset();
 
-    T *data_buf = query_buf->coord_scratch<T>();
-    pipeann::cpu_prefetch_t1((char *) data_buf);
-
     char *sector_scratch = query_buf->sector_scratch;
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
@@ -90,9 +87,7 @@ namespace pipeann {
     // --- Exact distance computation + membership verification ---
     uint64_t coord_buf_idx = 0;
     auto compute_exact_dists_and_push = [&](const DiskNode<T> &node, const unsigned id) -> bool {
-      T *node_fp_coords_copy = data_buf;
-      memcpy(node_fp_coords_copy, node.coords, meta_.data_dim * sizeof(T));
-      float cur_expanded_dist = dist_cmp->compare(query, node_fp_coords_copy, (unsigned) aligned_dim);
+      float cur_expanded_dist = node_distance_->compare_sym(query_buf->aligned_query_, node.coords, meta_.data_dim);
 
       if (!is_member(id, node)) {
         return false;
@@ -105,9 +100,9 @@ namespace pipeann {
           LOG(ERROR) << "Please allocate larger coord_buf.";
           crash();
         }
-        T *coord_ptr = insert_ctx->coord_buf + coord_buf_idx * aligned_dim;
-        memcpy(coord_ptr, node.coords, meta_.data_dim * sizeof(T));
-        insert_ctx->coord_map.insert(std::make_pair(id, coord_ptr));
+        uint8_t *coord_ptr = insert_ctx->coord_buf + coord_buf_idx * meta_.vector_bytes();
+        memcpy(coord_ptr, node.coords, meta_.vector_bytes());
+        insert_ctx->coord_map.insert(std::make_pair(id, static_cast<uint32_t>(coord_buf_idx)));
         coord_buf_idx++;
       }
 
@@ -118,7 +113,8 @@ namespace pipeann {
       // only reads the top-k tags it returns).
       if (node_out != nullptr) {
         NodePayload payload;
-        payload.coords.assign(node.coords, node.coords + meta_.data_dim);
+        payload.coords.resize(meta_.data_dim);
+        node_distance_->decode(node.coords, payload.coords.data(), meta_.data_dim);
         if (meta_.attr_size > 0)
           payload.attrs = Attributes::deserialize((char *) node.attrs);
         node_out->insert(std::make_pair(id2tag(id), std::move(payload)));
@@ -197,7 +193,8 @@ namespace pipeann {
 
       n_computes += nbors_cand_size;
       if (nbors_cand_size) {
-        nbr_handler->compute_dists(query_buf, nbr_ids, nbors_cand_size);
+        nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, nbr_ids, nbors_cand_size,
+                                   query_buf->aligned_dist_scratch);
         if (stats != nullptr) {
           stats->n_cmps += nbors_cand_size;
         }
@@ -247,19 +244,20 @@ namespace pipeann {
     std::vector<unsigned> mem_tags(mem_L);
     std::vector<float> mem_dists(mem_L);
 
+    size_t n_seed = 0;
     if (mem_L) {
       // Seed with the mem-index distances (already ascending) so the first beam
       // reads can go out before the PQ query table is built; the build + seed
       // re-scoring below then overlap the first SSD read.
-      mem_index_->search_with_tags_fast(query, mem_L, mem_tags.data(), mem_dists.data());
-      const uint64_t n_seed = std::min<uint64_t>(mem_L, l_pool);
+      const size_t found = mem_index_->search_with_tags(query1, mem_L, mem_L, mem_tags.data(), mem_dists.data());
+      n_seed = std::min<uint64_t>(found, l_pool);
       for (uint64_t i = 0; i < n_seed; ++i) {
         visited.insert(mem_tags[i]);
         pool.seed(Neighbor(mem_tags[i], mem_dists[i]));
       }
     } else {
-      nbr_handler->initialize_query(query, query_buf);
-      nbr_handler->compute_dists(query_buf, &meta_.entry_point_id, 1);
+      initialize_query(query, query_buf);
+      nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, &meta_.entry_point_id, 1, query_buf->aligned_dist_scratch);
       visited.insert(meta_.entry_point_id);
       pool.insert(Neighbor(meta_.entry_point_id, dist_scratch[0]));
     }
@@ -406,8 +404,8 @@ namespace pipeann {
     send_best_read_req(cur_beam_width - on_flight_ios.size());
 
     if (mem_L) {  // Overlap the PQ query-table build with the first read.
-      nbr_handler->initialize_query(query, query_buf);
-      nbr_handler->compute_dists(query_buf, mem_tags.data(), mem_L);
+      initialize_query(query, query_buf);
+      nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, mem_tags.data(), n_seed, query_buf->aligned_dist_scratch);
       pool.rescore_seeds(dist_scratch);
     }
     unsigned marker = 0;

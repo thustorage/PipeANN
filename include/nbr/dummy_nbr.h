@@ -16,7 +16,7 @@ namespace pipeann {
 
     virtual ~DummyNeighbor() = default;
 
-    std::string get_name() {
+    std::string get_name() const {
       return "DummyNeighbor";
     }
   };

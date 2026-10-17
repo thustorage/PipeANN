@@ -18,6 +18,7 @@
 #include "utils/percentile_stats.h"
 #include "utils/tsl/robin_map.h"
 #include "nbr/abstract_nbr.h"
+#include "nbr/rabitq_nbr.h"
 #include "utils.h"
 #include "index.h"
 
@@ -97,21 +98,19 @@ namespace pipeann {
     }
 
     void init_query_buf(QueryBuffer &buf) {
-      pipeann::alloc_aligned((void **) &buf.coord_scratch_, this->aligned_dim * sizeof(T), 8 * sizeof(T));
       buf.sector_scratch = (char *) this->reader->alloc_io_buf(MAX_N_SECTOR_READS * io_size_dense, SECTOR_LEN);
-      pipeann::alloc_aligned((void **) &buf.nbr_vec_scratch,
-                             MAX_N_EDGES * AbstractNeighbor<T>::MAX_BYTES_PER_NBR * sizeof(uint8_t), 256);
       pipeann::alloc_aligned((void **) &buf.nbr_id_scratch, MAX_N_EDGES * sizeof(uint32_t), 256);
       pipeann::alloc_aligned((void **) &buf.nbr_ctx_scratch, ROUND_UP(nbr_handler->query_ctx_size(), 256), 256);
       pipeann::alloc_aligned((void **) &buf.aligned_dist_scratch, MAX_N_EDGES * sizeof(float), 256);
-      pipeann::alloc_aligned((void **) &buf.aligned_query_, this->aligned_dim * sizeof(T), 8 * sizeof(T));
+      const size_t query_bytes = ROUND_UP(std::max<uint64_t>(this->aligned_dim * sizeof(T),
+                                                            meta_.vector_bytes()), 256);
+      pipeann::alloc_aligned((void **) &buf.aligned_query_, query_bytes, 256);
 
       buf.visited = new FlatVisitedSet(8192);
       buf.page_visited = new tsl::robin_set<unsigned>(4096);
 
       memset(buf.sector_scratch, 0, MAX_N_SECTOR_READS * io_size_dense);
-      memset(buf.coord_scratch_, 0, this->aligned_dim * sizeof(T));
-      memset(buf.aligned_query_, 0, this->aligned_dim * sizeof(T));
+      memset(buf.aligned_query_, 0, query_bytes);
     }
 
     QueryBuffer *pop_query_buf(const T *query) {
@@ -130,6 +129,14 @@ namespace pipeann {
         }
       }
       return data;
+    }
+
+    // Run after RAW-query navigation. Neighbor scoring uses a prepared query;
+    // full-distance scoring uses the same representation as the stored nodes.
+    // The caller must normalize COSINE queries before this step.
+    void initialize_query(const T *query, QueryBuffer *buf) {
+      nbr_handler->initialize_query(query, buf->nbr_ctx_scratch);
+      node_distance_->encode(query, buf->aligned_query_, meta_.data_dim);
     }
 
     void push_query_buf(QueryBuffer *data) {
@@ -165,8 +172,8 @@ namespace pipeann {
     // output_fields without a second disk read. nullptr (the default) => no
     // payload is collected and the search path is unchanged.
     struct NodePayload {
-      std::vector<T> coords;  // data_dim floats (the raw vector)
-      Attributes attrs;       // node's on-disk filterable scalar attributes
+      std::vector<T> coords;  // decoded coordinates
+      Attributes attrs;     // node's on-disk filterable scalar attributes
     };
     using NodeOut = tsl::robin_map<TagT, NodePayload>;
 
@@ -217,8 +224,7 @@ namespace pipeann {
     // After merge, reload the index.
     void reload(const char *index_prefix);
 
-    void write_metadata_and_pq(const std::string &in_path_prefix, const std::string &out_path_prefix,
-                               std::vector<TagT> *new_tags = nullptr);
+    void write_metadata_and_pq(const std::string &out_path_prefix, std::vector<TagT> *new_tags = nullptr);
 
     void copy_index(const std::string &prefix_in, const std::string &prefix_out);
 
@@ -229,6 +235,10 @@ namespace pipeann {
     // pure-scalar Query path, which has internal ids (from pre_filter) before
     // the id2tag translation. Results are inserted into *out keyed by tag.
     void get_nodes_by_ids(const std::vector<uint32_t> &ids, NodeOut *out);
+
+    // Copies the stored payload (RAW values or RaBitQ8 code), without decoding.
+    // The output buffer must hold at least meta_.vector_bytes() bytes.
+    int get_vector_by_id(const uint32_t &id, void *vector);
 
     // Batch-read node payloads addressed by tag instead of internal id. Resolves
     // each wanted tag back to an internal id via the id->tag map, then delegates
@@ -266,10 +276,10 @@ namespace pipeann {
 
     // Neighbor handler.
     AbstractNeighbor<T> *nbr_handler;
+    std::unique_ptr<Distance<T>> node_distance_;
 
-    // Distance comparator.
+    // Distance metric.
     pipeann::Metric metric;
-    std::shared_ptr<Distance<T>> dist_cmp;
 
     // Update-related parameters.
     IndexBuildParameters params;
@@ -335,14 +345,15 @@ namespace pipeann {
 
     // Direct insert related.
     struct InsertContext {
-      tsl::robin_map<uint32_t, T *> coord_map;
-      T *coord_buf;
+      // Preserve the on-disk vector payload: RAW bytes or complete RaBitQ code.
+      tsl::robin_map<uint32_t, uint32_t> coord_map;  // Node ID -> record slot in coord_buf.
+      uint8_t *coord_buf;
       std::vector<uint64_t> hint_pages;
       std::vector<uint64_t> page_ref;
 
-      InsertContext(uint64_t max_nodes, uint64_t aligned_dim) {
+      InsertContext(uint64_t max_nodes, uint64_t vector_bytes) {
         coord_map.reserve(max_nodes);
-        pipeann::alloc_aligned((void **) &coord_buf, max_nodes * aligned_dim * sizeof(T), 256);
+        pipeann::alloc_aligned((void **) &coord_buf, max_nodes * vector_bytes, 256);
       }
 
       ~InsertContext() {
@@ -372,8 +383,6 @@ namespace pipeann {
 
     // Background I/O thread function.
     void bg_io_thread();
-
-    int get_vector_by_id(const uint32_t &id, T *vector);
 
     // Deduplicate sorted results and copy top-k to output arrays.
     size_t copy_top_k(const std::vector<Neighbor> &sorted_results, uint64_t k, TagT *res_tags, float *res_dists,

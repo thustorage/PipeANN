@@ -39,15 +39,12 @@ namespace pipeann {
     query_buf->reset();
 
     // pointers to current vector for comparison
-    T *data_buf = query_buf->coord_scratch<T>();
-    pipeann::cpu_prefetch_t1((char *) data_buf);
 
     // sector scratch
     char *sector_scratch = query_buf->sector_scratch;
     uint64_t &sector_scratch_idx = query_buf->sector_idx;
 
     // query <-> PQ chunk centers distances
-    nbr_handler->initialize_query(query, query_buf);
     float *dist_scratch = query_buf->aligned_dist_scratch;
 
     Timer query_timer, io_timer, cpu_timer;
@@ -59,9 +56,8 @@ namespace pipeann {
     full_retset.reserve(4096);
 
     auto compute_exact_dists_and_push = [&](const DiskNode<T> &node, const unsigned id) -> float {
-      T *node_fp_coords_copy = data_buf;
-      memcpy(node_fp_coords_copy, node.coords, meta_.data_dim * sizeof(T));
-      float cur_expanded_dist = dist_cmp->compare(query, node_fp_coords_copy, (unsigned) aligned_dim);
+      float cur_expanded_dist = node_distance_->compare_sym(query_buf->aligned_query_, node.coords,
+                                                               meta_.data_dim);
       full_retset.push_back(Neighbor(id, cur_expanded_dist));
       return cur_expanded_dist;
     };
@@ -76,7 +72,8 @@ namespace pipeann {
         }
       }
       if (nbors_cand_size) {
-        nbr_handler->compute_dists(query_buf, node_nbrs, nbors_cand_size);
+        nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, node_nbrs, nbors_cand_size,
+                                    query_buf->aligned_dist_scratch);
         for (unsigned m = 0; m < nbors_cand_size; ++m) {
           const int nbor_id = node_nbrs[m];
           const float nbor_dist = query_buf->aligned_dist_scratch[m];
@@ -89,7 +86,8 @@ namespace pipeann {
     };
 
     auto compute_and_add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids) {
-      nbr_handler->compute_dists(query_buf, node_ids, n_ids);
+      nbr_handler->compute_dists(query_buf->nbr_ctx_scratch, node_ids, n_ids,
+                                    query_buf->aligned_dist_scratch);
       for (uint64_t i = 0; i < n_ids; ++i) {
         pool.insert(Neighbor(node_ids[i], query_buf->aligned_dist_scratch[i]));
         visited.insert(node_ids[i]);
@@ -103,9 +101,11 @@ namespace pipeann {
     if (mem_L) {
       std::vector<unsigned> mem_tags(mem_L);
       std::vector<float> mem_dists(mem_L);
-      mem_index_->search_with_tags(query, mem_L, mem_L, mem_tags.data(), mem_dists.data());
-      compute_and_add_to_retset(mem_tags.data(), std::min((unsigned) mem_L, (unsigned) l_search));
+      const size_t found = mem_index_->search_with_tags(query1, mem_L, mem_L, mem_tags.data(), mem_dists.data());
+      initialize_query(query, query_buf);
+      compute_and_add_to_retset(mem_tags.data(), std::min<uint64_t>(found, l_search));
     } else {
+      initialize_query(query, query_buf);
       compute_and_add_to_retset(&meta_.entry_point_id, 1);
     }
 
@@ -127,7 +127,8 @@ namespace pipeann {
     std::vector<char> last_pages(SECTOR_LEN * beam_width * 2);
 
     // search on disk.
-    while (!pool.all_visited()) {
+    // The last fetched pages still contain deferred nodes after the pool is exhausted.
+    while (!pool.all_visited() || !last_io_snapshot.empty()) {
       // clear iteration state
       frontier.clear();
       frontier_nhoods.clear();

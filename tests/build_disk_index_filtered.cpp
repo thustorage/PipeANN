@@ -61,17 +61,17 @@ int main(int argc, char **argv) {
 
       std::string nbr_type = argv[11];
       if (std::string(argv[1]) == std::string("float")) {
-        pipeann::AbstractNeighbor<float> *nbr_handler = pipeann::get_nbr_handler<float>(m, nbr_type);
+        pipeann::AbstractNeighbor<float> *nbr_handler = pipeann::create_neighbor<float>(m, nbr_type);
         pipeann::build_disk_index<float>(argv[2], argv[3], std::stoi(argv[4]), std::stoi(argv[6]), std::stoi(argv[8]),
                                          std::stoi(argv[9]), std::stoi(argv[7]), m, nullptr, nbr_handler, attr_writer,
                                          std::stoi(argv[5]));
       } else if (std::string(argv[1]) == std::string("int8")) {
-        pipeann::AbstractNeighbor<int8_t> *nbr_handler = pipeann::get_nbr_handler<int8_t>(m, nbr_type);
+        pipeann::AbstractNeighbor<int8_t> *nbr_handler = pipeann::create_neighbor<int8_t>(m, nbr_type);
         pipeann::build_disk_index<int8_t>(argv[2], argv[3], std::stoi(argv[4]), std::stoi(argv[6]), std::stoi(argv[8]),
                                           std::stoi(argv[9]), std::stoi(argv[7]), m, nullptr, nbr_handler, attr_writer,
                                           std::stoi(argv[5]));
       } else if (std::string(argv[1]) == std::string("uint8")) {
-        pipeann::AbstractNeighbor<uint8_t> *nbr_handler = pipeann::get_nbr_handler<uint8_t>(m, nbr_type);
+        pipeann::AbstractNeighbor<uint8_t> *nbr_handler = pipeann::create_neighbor<uint8_t>(m, nbr_type);
         pipeann::build_disk_index<uint8_t>(argv[2], argv[3], std::stoi(argv[4]), std::stoi(argv[6]), std::stoi(argv[8]),
                                            std::stoi(argv[9]), std::stoi(argv[7]), m, nullptr, nbr_handler,
                                            attr_writer, std::stoi(argv[5]));

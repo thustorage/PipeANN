@@ -41,10 +41,10 @@ namespace pipeann {
   // pruned_list: output, IDs of the pruned neighbors.
   // params: build parameters (R, C, alpha, saturate_graph).
   // metric: distance metric.
-  // compute_distance: callable to compute distance between two IDs: float(uint32_t, uint32_t)
-  template<typename DistFunc>
+  // compute_distances: one-to-many callback: void(uint32_t, const uint32_t *, size_t, float *)
+  template<typename DistBatchFunc>
   inline void prune_neighbors(std::vector<Neighbor> &pool, std::vector<uint32_t> &pruned_list,
-                              const IndexBuildParameters &params, Metric metric, DistFunc &&compute_distance) {
+                              const IndexBuildParameters &params, Metric metric, DistBatchFunc &&compute_distances) {
     if (pool.empty())
       return;
 
@@ -75,11 +75,18 @@ namespace pipeann {
         result_set.insert(p);
         // Dynamic programming: if p (current) is included,
         // then D(t, p0) / D(t, p) should be updated.
-        for (uint32_t t = start + 1; t < pool.size() && t < maxc; t++) {
-          if (occlude_factor[t] > alpha)
-            continue;
-          float djk = compute_distance(p.id, pool[t].id);
-          occlude_factor[t] = std::max(occlude_factor[t], get_occlude_factor(metric, pool[t].distance, djk));
+        std::vector<uint32_t> ids, positions;
+        for (uint32_t t = start + 1; t < pool.size() && t < maxc; ++t) {
+          if (occlude_factor[t] <= alpha) {
+            ids.push_back(pool[t].id);
+            positions.push_back(t);
+          }
+        }
+        std::vector<float> distances(ids.size());
+        if (!ids.empty()) compute_distances(p.id, ids.data(), ids.size(), distances.data());
+        for (size_t i = 0; i < ids.size(); ++i) {
+          auto t = positions[i];
+          occlude_factor[t] = std::max(occlude_factor[t], get_occlude_factor(metric, pool[t].distance, distances[i]));
         }
         start++;
       }

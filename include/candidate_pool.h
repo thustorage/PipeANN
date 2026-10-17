@@ -140,8 +140,8 @@ namespace pipeann {
     // co-sort only ever sees either a small survivor set or the pre-full first
     // few expansions. Final pool content and markers match calling insert() on
     // each element. Unlike insert(), slots past size() are not restored to +inf
-    // (overflow parks there), so only callers that never read past size() (the
-    // async pipe search) may use it. Both input arrays are permuted in place.
+    // (overflow parks there), so only callers that never read past size()
+    // may use it. Both input arrays are permuted in place.
     void insert_batch(uint32_t *ids, float *dists, unsigned n) {
       if (cur_list_size_ == l_pool_) {
         // Full pool: a candidate no better than the current worst can never

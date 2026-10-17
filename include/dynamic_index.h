@@ -57,7 +57,8 @@ class DynamicIndex : public BaseDynamicIndex {
     }
     reader_.reset(new LinuxAlignedFileReader());
     nbr_handler_ = new pipeann::PQNeighbor<T>(metric_);
-    mem_index_.reset(new pipeann::Index<T, TagT>(metric_, data_dim_));
+    mem_index_ =
+        std::make_shared<pipeann::Index<T, TagT>>(std::make_unique<pipeann::RawNeighbor<T>>(metric_, data_dim_));
     disk_index_.reset(new pipeann::SSDIndex<T, TagT>(metric_, reader_, nbr_handler_, true, params, enable_tag2id));
 
     mem_index_params_.set(32, 64, 750, 1.2, params_.num_threads, true);
@@ -99,7 +100,7 @@ class DynamicIndex : public BaseDynamicIndex {
         load_prefix = shadow_prefix;
       }
 
-      disk_index_->load(load_prefix.c_str(), true); // force recopy for SPDK.
+      disk_index_->load(load_prefix.c_str(), true);  // force recopy for SPDK.
       if (use_mem_index_for_disk_index_) {
         // mem_index is disk_index's navigation graph.
         disk_index_->mem_index_.reset(mem_index_.get());
@@ -118,7 +119,9 @@ class DynamicIndex : public BaseDynamicIndex {
     LOG(INFO) << "Transform memory index to disk index.";
 
     const std::string data_path = cur_index_prefix_ + "_mem_data.bin";
-    pipeann::save_bin<T>(data_path, mem_index_->_data.data(), mem_index_->_nd, mem_index_->_dim);
+    // The initial in-memory index stores contiguous RAW vectors.
+    pipeann::save_bin<T>(data_path, reinterpret_cast<T *>(mem_index_->_vectors->data()), mem_index_->_nd,
+                         mem_index_->_dim);
     LOG(INFO) << "Memory index data saved to " << data_path;
 
     const std::string tags_path = cur_index_prefix_ + "_disk.index.tags";
@@ -217,8 +220,8 @@ class DynamicIndex : public BaseDynamicIndex {
   // 0 means keep the offline builder's automatic (dataset-size-based) defaults.
   void build_from_buffer(const T *vectors, const TagT *tags, uint64_t n,
                          const std::vector<pipeann::Attributes> *attrs_vec,
-                         const std::map<uint32_t, std::string> &field_types,
-                         uint32_t build_R = 0, uint32_t build_L = 0) {
+                         const std::map<uint32_t, std::string> &field_types, uint32_t build_R = 0,
+                         uint32_t build_L = 0) {
     if (cur_index_prefix_.empty()) {
       throw std::runtime_error("build_from_buffer: index prefix is empty");
     }
@@ -297,10 +300,10 @@ class DynamicIndex : public BaseDynamicIndex {
   }
 
   std::shared_ptr<pipeann::AttrIndex> create_attr_index(uint32_t key, const std::string &filename,
-                                                       const std::string &attr_type) {
+                                                        const std::string &attr_type) {
     uint64_t n_vectors = use_disk_index_ ? disk_index_->cur_id.load() : mem_index_->get_num_points();
-    auto attr_index = std::shared_ptr<pipeann::AttrIndex>(
-        pipeann::create_empty_attr_index(filename, attr_type, n_vectors));
+    auto attr_index =
+        std::shared_ptr<pipeann::AttrIndex>(pipeann::create_empty_attr_index(filename, attr_type, n_vectors));
     native_attr_indexes_.push_back(attr_index);
     attr_index_map_[key] = attr_index.get();
     return attr_index;
@@ -323,8 +326,7 @@ class DynamicIndex : public BaseDynamicIndex {
   // Use `$$varName` placeholders in the filter for batch/late-binding workflows;
   // when no placeholders are present, `attrs_template` is fully populated and
   // can be passed directly to search.
-  pipeann::dsl::CompiledFilter compile_filter(const std::string &json,
-                                              const pipeann::dsl::Schema &schema) {
+  pipeann::dsl::CompiledFilter compile_filter(const std::string &json, const pipeann::dsl::Schema &schema) {
     return pipeann::dsl::compile(json, schema);
   }
 
@@ -334,8 +336,8 @@ class DynamicIndex : public BaseDynamicIndex {
   // then adopts the returned raw AttrIndex* pointers into native_attr_indexes_
   // / attr_index_map_ so subsequent add() calls and the search path can find
   // them. Returns (Selector* owned by caller, one Attributes per query row).
-  std::pair<pipeann::Selector *, std::vector<pipeann::Attributes>>
-  load_filter_from_json(const std::string &config_path) {
+  std::pair<pipeann::Selector *, std::vector<pipeann::Attributes>> load_filter_from_json(
+      const std::string &config_path) {
     if (!use_disk_index_) {
       throw std::runtime_error("load_filter_from_json requires a loaded disk index");
     }
@@ -356,8 +358,8 @@ class DynamicIndex : public BaseDynamicIndex {
   // When `node_out` is non-null, also populates each match's payload (vector +
   // attrs) keyed by tag, for serving output_fields on the Query path; each
   // matched node is read once (before the id→tag translation).
-  std::vector<TagT> filter_only(pipeann::Selector *selector, const pipeann::Attributes &query_attrs,
-                                size_t limit, NodeOut *node_out = nullptr) {
+  std::vector<TagT> filter_only(pipeann::Selector *selector, const pipeann::Attributes &query_attrs, size_t limit,
+                                NodeOut *node_out = nullptr) {
     if (selector == nullptr) {
       throw std::runtime_error("filter_only: selector is null");
     }
@@ -405,9 +407,9 @@ class DynamicIndex : public BaseDynamicIndex {
     reader.close();
 
     auto s = std::chrono::high_resolution_clock::now();
-    mem_index_.reset(new pipeann::Index<T, TagT>(metric_, data_dim));
-    // We should normalize_cosine here, as data is not pre-normalized.
-    mem_index_->build(sample_data_bin.c_str(), data_num, mem_index_params_, tags);
+    const auto graph_file = pipeann::prepare_build_vectors<T>(sample_data_bin, metric_);
+    mem_index_ = std::make_shared<pipeann::Index<T, TagT>>(pipeann::load_neighbor<T>(graph_file, metric_));
+    mem_index_->build(mem_index_params_, tags);
     std::chrono::duration<double> diff = std::chrono::high_resolution_clock::now() - s;
 
     LOG(INFO) << "Finish building memory index, indexing time: " << diff.count() << "\n";
@@ -423,14 +425,14 @@ class DynamicIndex : public BaseDynamicIndex {
   // output_fields without a second disk read.
   size_t search(const T *query, uint32_t topk, uint32_t L, TagT *out_ids, float *out_dists,
                 pipeann::QueryStats *stats = nullptr, pipeann::Selector *selector = nullptr,
-                const pipeann::Attributes *query_attrs = nullptr,
-                float range = std::numeric_limits<float>::infinity(), NodeOut *node_out = nullptr) {
+                const pipeann::Attributes *query_attrs = nullptr, float range = std::numeric_limits<float>::infinity(),
+                NodeOut *node_out = nullptr) {
     std::vector<TagT> tags(L);
     std::vector<float> distances(L);
     const bool use_range = !std::isinf(range);
     size_t n_valid = L;
 
-    if (selector != nullptr) { // filtered search.
+    if (selector != nullptr) {  // filtered search.
       if (use_disk_index_) {
         // spec_filter_search returns the count of true filter matches (non-member
         // sentinels already dropped); honor it so padding isn't surfaced.
@@ -440,13 +442,13 @@ class DynamicIndex : public BaseDynamicIndex {
         auto cand_ids = selector->pre_filter(*query_attrs, reader_.get(), /*strict=*/true);
         n_valid = mem_index_->search_with_tags(query, L, L, tags.data(), distances.data(), &cand_ids);
       }
-    } else if (use_range) { // range search (SSD only).
+    } else if (use_range) {  // range search (SSD only).
       n_valid = disk_index_->range_search(query, range, tags.data(), distances.data(), 32, mem_L, L, stats);
-    } else { // normal ANNS.
+    } else {  // normal ANNS.
       if (use_disk_index_) {
         disk_index_->pipe_search(query, L, mem_L, L, tags.data(), distances.data(), 32, stats, node_out);
       } else {
-        mem_index_->search_with_tags(query, L, L, tags.data(), distances.data());
+        n_valid = mem_index_->search_with_tags(query, L, L, tags.data(), distances.data());
       }
     }
 
@@ -487,7 +489,7 @@ class DynamicIndex : public BaseDynamicIndex {
       throw std::runtime_error("Number of query attrs must match number of queries");
     }
 
-#pragma omp parallel for schedule(dynamic) num_threads(std::min((uint32_t)omp_get_max_threads(), (n_queries + 7) / 8))
+#pragma omp parallel for schedule(dynamic) num_threads(std::min((uint32_t) omp_get_max_threads(), (n_queries + 7) / 8))
     for (uint32_t i = 0; i < n_queries; i++) {
       search(queries + i * data_dim_, topk, L, out_ids + i * topk, out_dists + i * topk, nullptr, selector,
              selector != nullptr ? &query_attrs[i] : nullptr, range);
@@ -499,7 +501,7 @@ class DynamicIndex : public BaseDynamicIndex {
            const std::vector<pipeann::Attributes> *attrs_vec = nullptr) {
     save_mu_.lock_shared();
 
-#pragma omp parallel for schedule(dynamic) num_threads(std::min((uint32_t)omp_get_max_threads(), (n_vectors + 7) / 8))
+#pragma omp parallel for schedule(dynamic) num_threads(std::min((uint32_t) omp_get_max_threads(), (n_vectors + 7) / 8))
     for (uint32_t i = 0; i < n_vectors; i++) {
       const T *vector_p = vectors + i * data_dim_;
       const pipeann::Attributes *attr_p = (attrs_vec != nullptr) ? &(*attrs_vec)[i] : nullptr;

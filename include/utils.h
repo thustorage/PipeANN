@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,9 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
 #include <malloc.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -169,21 +173,28 @@ namespace pipeann {
     reader.read((char *) data, npts * dim * sizeof(T));
   }
 
-  template<typename T>
-  inline void load_bin_impl(std::basic_istream<char> &reader, std::vector<T> &data, size_t &npts, size_t &dim,
+  // FileT defaults to the vector element type. An explicit FileT also allows
+  // typed records to be read directly into a byte vector, without conversion.
+  template<typename FileT = void, typename T, typename Allocator>
+  inline void load_bin_impl(std::basic_istream<char> &reader, std::vector<T, Allocator> &data, size_t &npts, size_t &dim,
                             size_t file_offset = 0) {
-    int npts_i32, dim_i32;
+    using ElementT = std::conditional_t<std::is_void_v<FileT>, T, FileT>;
+    static_assert(std::is_same_v<T, ElementT> || std::is_same_v<T, uint8_t>);
+    uint32_t npts_i32 = 0, dim_i32 = 0;
 
     reader.seekg(file_offset, reader.beg);
     reader.read((char *) &npts_i32, sizeof(int));
     reader.read((char *) &dim_i32, sizeof(int));
+    if (!reader) throw std::runtime_error("Cannot read bin header");
     npts = (unsigned) npts_i32;
     dim = (unsigned) dim_i32;
 
     DLOG(INFO) << "Metadata: #pts = " << npts << ", #dims = " << dim << "...";
 
-    data.resize(npts * dim);
-    reader.read((char *) (data.data()), npts * dim * sizeof(T));
+    const size_t bytes = npts * dim * sizeof(ElementT);
+    data.resize(bytes / sizeof(T));
+    reader.read(reinterpret_cast<char *>(data.data()), bytes);
+    if (!reader) throw std::runtime_error("Truncated bin file");
   }
 
   template<typename T>
@@ -195,14 +206,14 @@ namespace pipeann {
     load_bin_impl<T>(reader, data, npts, dim, offset);
   }
 
-  template<typename T>
-  inline void load_bin(const std::string &bin_file, std::vector<T> &data, size_t &npts, size_t &dim,
+  template<typename FileT = void, typename T, typename Allocator>
+  inline void load_bin(const std::string &bin_file, std::vector<T, Allocator> &data, size_t &npts, size_t &dim,
                        size_t offset = 0) {
     DLOG(INFO) << "Reading bin file " << bin_file.c_str() << " ...";
     std::ifstream reader(bin_file, std::ios::binary | std::ios::ate);
     reader.seekg(0);
 
-    load_bin_impl<T>(reader, data, npts, dim, offset);
+    load_bin_impl<FileT>(reader, data, npts, dim, offset);
   }
 
   inline void load_truthset(const std::string &bin_file, uint32_t *&ids, float *&dists, size_t &npts, size_t &dim,
@@ -297,10 +308,9 @@ namespace pipeann {
     }
   }
 
-  // NOTE: good efficiency when total_vec_size is integral multiple of 64
+  // Include a partial final block (e.g. a 128-byte code plus its 16-byte header).
   inline void prefetch_vector(const char *vec, size_t vecsize) {
-    size_t max_prefetch_size = (vecsize / 64) * 64;
-    for (size_t d = 0; d < max_prefetch_size; d += 64)
+    for (size_t d = 0; d < vecsize; d += 64)
       pipeann::cpu_prefetch_t0((const char *) vec + d);
   }
 
@@ -344,14 +354,13 @@ namespace pipeann {
     int first_layer_fanout = 6;
     int second_layer_fanout = 10;
     int k = 2;  // k-NN in leaf build
-    int num_hyperplanes = 12;
     int climit = 128;
     uint32_t seed = 42;
 
     void print() {
       LOG(INFO) << "PiPNNConfig: cmax=" << cmax << " cmin=" << cmin << " p_samp=" << p_samp << " pmax=" << pmax
                 << " first_layer_fanout=" << first_layer_fanout << " second_layer_fanout=" << second_layer_fanout
-                << " k=" << k << " num_hyperplanes=" << num_hyperplanes << " climit=" << climit << " seed=" << seed;
+                << " k=" << k << " climit=" << climit << " seed=" << seed;
     }
   };
 
@@ -383,8 +392,8 @@ namespace pipeann {
     }
 
     void pipnn_set(int cmax, int cmin, float p_samp, int pmax, int first_layer_fanout, int second_layer_fanout, int k,
-                   int num_hyperplanes, int climit, uint32_t seed = 42) {
-      this->pipnn_config = {cmax,   cmin, p_samp, pmax, first_layer_fanout, second_layer_fanout, k, num_hyperplanes,
+                   int climit, uint32_t seed = 42) {
+      this->pipnn_config = {cmax,   cmin, p_samp, pmax, first_layer_fanout, second_layer_fanout, k,
                             climit, seed};
     }
 
@@ -425,6 +434,58 @@ namespace pipeann {
       return (distance > other.distance) || (distance == other.distance && id >= other.id);
     }
   };
+
+  // Squared normalization scale used by internal IP/cosine distances and their conversions.
+  template<typename T>
+  constexpr float metric_scale() {
+    if constexpr (std::is_same_v<T, uint8_t>)
+      return 255.0f * 255.0f;
+    if constexpr (std::is_same_v<T, int8_t>)
+      return 127.0f * 127.0f;
+    return 1.0f;
+  }
+
+  // Convert the distance calculated by Distance<T>, to actual distance.
+  template<typename T>
+  inline float get_actual_distance(float distance, Metric m) {
+    if constexpr (!std::is_same_v<T, float> && !std::is_same_v<T, int8_t> && !std::is_same_v<T, uint8_t>) {
+      LOG(ERROR) << "Unsupported type: " << typeid(T).name();
+      return distance;
+    }
+    constexpr float A_2 = metric_scale<T>();
+
+    if (m == Metric::L2) {
+      return std::sqrt(distance);
+    } else if (m == Metric::COSINE) {
+      // distance = A^2 * (1 - cosine(theta))
+      return 1 - (distance / A_2);
+    } else if (m == Metric::INNER_PRODUCT) {
+      return A_2 - distance;
+    }
+    LOG(ERROR) << "Unsupported metric: " << m << " and type: " << typeid(T).name();
+    return distance;
+  }
+
+  // Inverse of get_actual_distance: convert a user-facing range threshold into
+  // the partial-order distance used internally by Distance<T>::compare().
+  template<typename T>
+  inline float get_partial_order_distance(float range, Metric m) {
+    if constexpr (!std::is_same_v<T, float> && !std::is_same_v<T, int8_t> && !std::is_same_v<T, uint8_t>) {
+      LOG(ERROR) << "Unsupported type: " << typeid(T).name();
+      return range;
+    }
+    constexpr float A_2 = metric_scale<T>();
+
+    if (m == Metric::L2) {
+      return range * range;
+    } else if (m == Metric::COSINE) {
+      return A_2 * (1.0f - range);
+    } else if (m == Metric::INNER_PRODUCT) {
+      return A_2 - range;
+    }
+    LOG(ERROR) << "Unsupported metric: " << m << " and type: " << typeid(T).name();
+    return range;
+  }
 
   /*
    * For float, we normalize to 1.
