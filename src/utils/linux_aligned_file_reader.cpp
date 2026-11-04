@@ -1104,7 +1104,32 @@ int LinuxAlignedFileReader::send_read(std::vector<IORequest> &reqs, void *ring) 
 #endif
 }
 
-#if !defined(USE_SPDK) && !defined(USE_URING)
+#if defined(USE_URING)
+void LinuxAlignedFileReader::send_reads(IORequest **reqs, uint32_t n, void *ctx) {
+  io_uring *ring = (io_uring *) ctx;
+  // [1] the page cache first, the misses into one batch
+  for (uint32_t i = 0; i < n; i++) {
+    IORequest &req = *reqs[i];
+#ifndef READ_ONLY_TESTS
+    if (read_from_cache(this->fd, req)) {
+      continue;
+    }
+#endif
+    auto sqe = io_uring_get_sqe(ring);
+    req.finished = false;
+    sqe->user_data = (uint64_t) &req;
+    io_uring_prep_read(sqe, fd, req.buf, req.len, req.offset);
+  }
+  // [2] one submit for the batch, the rest resubmitted after a short accept; no system call if all were cached
+  while (io_uring_sq_ready(ring) > 0) {
+    int ret = io_uring_submit(ring);
+    if (ret < 0 && ret != -EINTR && ret != -EAGAIN) {
+      LOG(ERROR) << "io_uring_submit failed: " << strerror(-ret);
+      return;
+    }
+  }
+}
+#elif !defined(USE_SPDK)
 void LinuxAlignedFileReader::send_reads(IORequest **reqs, uint32_t n, void *ctx) {
   // [1] the page cache first, the misses into one batch
   iocb_t *cbs[MAX_EVENTS];
