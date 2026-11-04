@@ -4,10 +4,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#ifndef IORING_SETUP_SQPOLL
-#define IORING_SETUP_SQPOLL (1U << 1)
-#endif
-
 #if defined(SYS_io_uring_setup)
 #define PIPEANN_IO_URING_SETUP SYS_io_uring_setup
 #elif defined(__NR_io_uring_setup)
@@ -31,9 +27,5 @@ static int setup_ring(unsigned flags) {
 }
 
 int main() {
-  int ret = setup_ring(0);
-  if (ret != 0) {
-    return ret;
-  }
-  return setup_ring(IORING_SETUP_SQPOLL);
+  return setup_ring(0);
 }

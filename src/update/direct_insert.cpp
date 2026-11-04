@@ -29,7 +29,7 @@ namespace pipeann {
   int SSDIndex<T, TagT>::insert_in_place(const T *point1, const TagT &tag, const Attributes *attrs) {
     QueryBuffer *read_data = this->pop_query_buf(point1);
     T *point = read_data->aligned_query<T>();  // normalized point for cosine.
-    void *ctx = reader->get_ctx(); // initialize ctx here, avoid SQ polling for insert.
+    void *ctx = reader->get_ctx(); // initialize ctx here.
 
     uint32_t target_id = cur_id++;
 

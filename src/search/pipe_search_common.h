@@ -3,9 +3,6 @@
 
 #include <limits>
 #include <type_traits>
-#ifdef USE_URING
-#include "liburing.h"
-#endif
 
 #include "candidate_pool.h"
 
@@ -38,11 +35,8 @@ namespace pipeann {
                                              std::vector<Neighbor> &full_retset, QueryStats *stats,
                                              InsertContext *insert_ctx, float range_partial, NodeOut *node_out) {
     QueryBuffer *query_buf = pop_query_buf(query1);
-#ifdef USE_URING
-    void *ctx = reader->get_ctx(IORING_SETUP_SQPOLL);
-#else
+    // A plain ring, as for inserts: one SQPOLL kernel poller per search thread doubles the cores a search needs.
     void *ctx = reader->get_ctx();
-#endif
 
     if (beam_width > MAX_N_SECTOR_READS) {
       LOG(ERROR) << "Beamwidth can not be higher than MAX_N_SECTOR_READS";
