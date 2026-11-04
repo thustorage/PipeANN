@@ -764,6 +764,8 @@ void LinuxAlignedFileReader::poll_alloc(void *ctx, std::vector<uint64_t> *page_r
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include "aligned_file_reader.h"
 #include "utils/tsl/robin_map.h"
@@ -773,6 +775,19 @@ void LinuxAlignedFileReader::poll_alloc(void *ctx, std::vector<uint64_t> *page_r
 namespace {
   typedef struct io_event io_event_t;
   typedef struct iocb iocb_t;
+
+  // A poll that has seen PIPEANN_POLL_SPINS empty polls in a row on this thread waits up to POLL_WAIT_NS for
+  // one completion instead, so a thread with nothing but waiting to do yields its core; unset or 0 keeps
+  // PipeANN's pure spin-polling.
+  constexpr long POLL_WAIT_NS = 100000;
+
+  int poll_spins() {
+    static const int spins = [] {
+      const char *text = std::getenv("PIPEANN_POLL_SPINS");
+      return text != nullptr ? std::atoi(text) : 0;
+    }();
+    return spins;
+  }
 
   // The completion ring the kernel maps at an aio context's address (its stable user ABI, the one
   // fio's userspace_reap reads): head and tail equal means no completion waits.
@@ -792,10 +807,22 @@ namespace {
   }
 
   int get_events(io_context_t ctx, io_event_t *evts) {
-    if (ring_empty(ctx)) {
-      return 0;  // what a non-blocking io_getevents would return, without the system call
+    static thread_local int empty = 0;
+    int ret;
+    if (poll_spins() > 0 && empty >= poll_spins()) {
+      timespec wait{0, POLL_WAIT_NS};
+      ret = io_getevents(ctx, 1, MAX_EVENTS, evts, &wait);
+    } else if (ring_empty(ctx)) {
+      ret = 0;  // what a non-blocking io_getevents would return, without the system call
+    } else {
+      ret = io_getevents(ctx, 0, MAX_EVENTS, evts, nullptr);
     }
-    return io_getevents(ctx, 0, MAX_EVENTS, evts, nullptr);
+    // an interrupted poll (EINTR, e.g. a ptrace stop) reaped nothing
+    if (ret == -EINTR) {
+      ret = 0;
+    }
+    empty = ret > 0 ? 0 : empty + 1;
+    return ret;
   }
 
   void execute_io(void *ctx, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
