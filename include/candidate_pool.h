@@ -270,6 +270,20 @@ namespace pipeann {
       return nullptr;
     }
 
+    // Mark candidate `id` visited wherever it now ranks, for a search that visits
+    // pages as they arrive rather than by rank; a no-op if the pool has dropped it.
+    // Everything below first_unvisited_ is already visited, so the walk starts there.
+    void mark_visited(unsigned id, bool is_member) {
+      for (unsigned marker = first_unvisited_; marker < cur_list_size_; ++marker) {
+        if (retset_[marker].id == id) {
+          retset_[marker].flag = false;
+          retset_[marker].visited = true;
+          retset_[marker].is_member = is_member;
+          return;
+        }
+      }
+    }
+
     // Advance the calc marker across the settled (visited) prefix, then return
     // the read frontier: the closest candidate still flagged for a read
     // (cur_list_size_ if none). Call after expanding the node returned by

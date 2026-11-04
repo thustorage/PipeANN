@@ -1,6 +1,7 @@
 #pragma once
 // Included by pipe_search.cpp and spec_filter_search.cpp which provide all necessary headers.
 
+#include <deque>
 #include <limits>
 #include <type_traits>
 
@@ -55,9 +56,9 @@ namespace pipeann {
     auto &visited = *(query_buf->visited);
     full_retset.reserve(l_pool * kExpandedNodesFactor);
 
-    // Maps ids whose page has arrived to the parsed node. The candidate pool
-    // consults it (through the ready predicate below) to pick the next candidate
-    // to exact-rank and to skip re-reads.
+    // For an insert's search, maps ids whose page has arrived to the parsed node.
+    // The candidate pool consults it (through the ready predicate below) to pick
+    // the next candidate to exact-rank and to skip re-reads.
     std::unordered_map<unsigned, DiskNode<T>> id_buf_map;
     // Sized to the deepest plausible set of landed-but-unexpanded pages so the
     // hot-loop inserts never rehash.
@@ -273,9 +274,15 @@ namespace pipeann {
         return read_req->finished;
       }
     };
-    std::queue<io_t> on_flight_ios;
+    std::deque<io_t> on_flight_ios;
     IORequest *queued[MAX_N_SECTOR_READS];  // reads chosen this round, sent together by send_best_read_req
     uint32_t n_queued = 0;
+    // A query search visits pages in the order they arrive, so a slow read holds none of the others back; arrived
+    // holds the landed pages not yet visited. An insert's search still lands its pages in launch order.
+    std::queue<io_t> arrived;
+    // Reads now finish out of launch order and a landed page is parsed in place, so a sector slot stays held until
+    // its page is visited (an insert's search: landed) instead of being reused when the ring comes back around.
+    bool slot_held[MAX_N_SECTOR_READS] = {};
 
     auto send_read_req = [&](Neighbor &item) -> bool {
       item.flag = false;
@@ -283,13 +290,17 @@ namespace pipeann {
       const unsigned loc = id2loc(item.id), pid = loc_sector_no(loc);
 
       uint64_t &cur_buf_idx = query_buf->sector_idx;
+      while (slot_held[cur_buf_idx]) {
+        cur_buf_idx = (cur_buf_idx + 1) % MAX_N_SECTOR_READS;
+      }
+      slot_held[cur_buf_idx] = true;
       auto buf = sector_scratch + cur_buf_idx * read_io_size;
       auto &req = query_buf->reqs[cur_buf_idx];
       req = IORequest(static_cast<uint64_t>(pid) * SECTOR_LEN, read_io_size, buf, u_loc_offset(loc), meta_.max_node_len,
                       sector_scratch);
       queued[n_queued++] = &req;
 
-      on_flight_ios.push(io_t{item, pid, loc, &req, UINT32_MAX});
+      on_flight_ios.push_back(io_t{item, pid, loc, &req, UINT32_MAX});
       cur_buf_idx = (cur_buf_idx + 1) % MAX_N_SECTOR_READS;
 
       if (stats != nullptr) {
@@ -305,15 +316,25 @@ namespace pipeann {
         reader->poll(ctx);
       }
       unsigned n_in = 0, n_out = 0;
-      while (!on_flight_ios.empty() && on_flight_ios.front().finished()) {
-        io_t &io = on_flight_ios.front();
-        id_buf_map.insert(std::make_pair(io.nbr.id, node_from_page((char *) io.read_req->buf, io.loc)));
+      for (auto it = on_flight_ios.begin(); it != on_flight_ios.end();) {
+        io_t &io = *it;
+        if (!io.finished()) {
+          if (insert_ctx != nullptr) {
+            break;
+          }
+          ++it;
+          continue;
+        }
         if (insert_ctx != nullptr) {
+          id_buf_map.insert(std::make_pair(io.nbr.id, node_from_page((char *) io.read_req->buf, io.loc)));
           insert_ctx->hint_pages.push_back(io.page_id);
+          slot_held[io.read_req - query_buf->reqs] = false;
+        } else {
+          arrived.push(io);
         }
         io.nbr.distance <= pool.worst().distance ? ++n_in : ++n_out;
         this->unlock_idx(idx_lock_table, io.nbr.id);
-        on_flight_ios.pop();
+        it = on_flight_ios.erase(it);
       }
       return std::make_pair(n_in, n_out);
     };
@@ -337,6 +358,18 @@ namespace pipeann {
     // calc_best_node, advanced by the main loop), so it must outlive the lambda.
     unsigned max_marker = 0;
     auto calc_best_node = [&]() -> int {
+      if (insert_ctx == nullptr) {
+        // Visit the page that arrived first, even one the pool has since dropped: its read is already paid for.
+        if (!arrived.empty()) {
+          const io_t io = arrived.front();
+          arrived.pop();
+          DiskNode<T> dnode = node_from_page((char *) io.read_req->buf, io.loc);
+          pool.mark_visited(io.nbr.id, compute_exact_dists_and_push(dnode, io.nbr.id));
+          compute_and_push_nbrs(dnode);
+          slot_held[io.read_req - query_buf->reqs] = false;
+        }
+        return (int) pool.frontier();
+      }
       // next_calc_nbr can only find work if some landed page is still
       // unexpanded (id_buf_map non-empty); the O(1) check skips its O(pool)
       // ready-probe scan on the frequent spins where no IO has landed yet.
@@ -425,7 +458,9 @@ namespace pipeann {
         }
       }
 
-      if ((int64_t) on_flight_ios.size() < cur_beam_width) {
+      // A landed page keeps its slot until visited, so leave one free for the read.
+      if ((int64_t) on_flight_ios.size() < cur_beam_width &&
+          on_flight_ios.size() + arrived.size() < MAX_N_SECTOR_READS) {
         send_best_read_req(1);
       }
       marker = calc_best_node();
