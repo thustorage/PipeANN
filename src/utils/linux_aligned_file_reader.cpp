@@ -773,6 +773,30 @@ namespace {
   typedef struct io_event io_event_t;
   typedef struct iocb iocb_t;
 
+  // The completion ring the kernel maps at an aio context's address (its stable user ABI, the one
+  // fio's userspace_reap reads): head and tail equal means no completion waits.
+  constexpr unsigned AIO_RING_MAGIC = 0xa10a10a1;
+  struct AioRing {
+    unsigned id, nr, head, tail, magic, compat_features, incompat_features, header_length;
+  };
+
+  bool ring_empty(io_context_t ctx) {
+    const AioRing *ring = reinterpret_cast<const AioRing *>(ctx);
+    if (ring->magic != AIO_RING_MAGIC) {
+      return false;
+    }
+    const unsigned head = __atomic_load_n(&ring->head, __ATOMIC_ACQUIRE);
+    const unsigned tail = __atomic_load_n(&ring->tail, __ATOMIC_ACQUIRE);
+    return head == tail;
+  }
+
+  int get_events(io_context_t ctx, io_event_t *evts) {
+    if (ring_empty(ctx)) {
+      return 0;  // what a non-blocking io_getevents would return, without the system call
+    }
+    return io_getevents(ctx, 0, MAX_EVENTS, evts, nullptr);
+  }
+
   void execute_io(void *ctx, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
     // break-up requests into chunks of size MAX_EVENTS each
     uint64_t n_iters = ROUND_UP(reqs.size(), MAX_EVENTS) / MAX_EVENTS;
@@ -969,7 +993,7 @@ int LinuxAlignedFileReader::poll(void *ctx) {
   // Poll a single completed IO request in the io_uring context.
   static __thread io_event_t evts[MAX_EVENTS]; 
   io_context_t io_ctx = (io_context_t) ctx;
-  int ret = io_getevents(io_ctx, 0, MAX_EVENTS, evts, nullptr);
+  int ret = get_events(io_ctx, evts);
   if (ret < 0) {
     LOG(ERROR) << "io_getevents() failed; returned " << ret << ", errno=" << errno << ":" << ::strerror(errno);
     return 0;
@@ -987,7 +1011,7 @@ int LinuxAlignedFileReader::poll(void *ctx) {
 void LinuxAlignedFileReader::poll_alloc(void *ctx, std::vector<uint64_t> *page_ref) {
   static __thread io_event_t evts[MAX_EVENTS];
   io_context_t io_ctx = (io_context_t) ctx;
-  int ret = io_getevents(io_ctx, 0, MAX_EVENTS, evts, nullptr);
+  int ret = get_events(io_ctx, evts);
   if (ret < 0) {
     LOG(ERROR) << "io_getevents() failed; returned " << ret << ", errno=" << errno << ":" << ::strerror(errno);
     return;
