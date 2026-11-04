@@ -89,6 +89,13 @@ class AlignedFileReader {
   virtual void send_io(std::vector<IORequest> &reqs, void *ctx, bool write) = 0;
   virtual int send_read(IORequest &req, void *ctx) = 0;
   virtual int send_read(std::vector<IORequest> &reqs, void *ctx) = 0;
+  // Send reqs[0..n) together, each served from the page cache when it holds the pages; an engine
+  // that cannot batch sends them one by one.
+  virtual void send_reads(IORequest **reqs, uint32_t n, void *ctx) {
+    for (uint32_t i = 0; i < n; i++) {
+      send_read(*reqs[i], ctx);
+    }
+  }
   virtual int poll(void *ctx) = 0;
   virtual void poll_alloc(void *ctx, std::vector<uint64_t> *page_ref) = 0;
 

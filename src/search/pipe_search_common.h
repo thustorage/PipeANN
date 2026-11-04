@@ -280,6 +280,8 @@ namespace pipeann {
       }
     };
     std::queue<io_t> on_flight_ios;
+    IORequest *queued[MAX_N_SECTOR_READS];  // reads chosen this round, sent together by send_best_read_req
+    uint32_t n_queued = 0;
 
     auto send_read_req = [&](Neighbor &item) -> bool {
       item.flag = false;
@@ -291,7 +293,7 @@ namespace pipeann {
       auto &req = query_buf->reqs[cur_buf_idx];
       req = IORequest(static_cast<uint64_t>(pid) * SECTOR_LEN, read_io_size, buf, u_loc_offset(loc), meta_.max_node_len,
                       sector_scratch);
-      reader->send_read(req, ctx);
+      queued[n_queued++] = &req;
 
       on_flight_ios.push(io_t{item, pid, loc, &req, UINT32_MAX});
       cur_buf_idx = (cur_buf_idx + 1) % MAX_N_SECTOR_READS;
@@ -331,6 +333,8 @@ namespace pipeann {
         }
         n_sent += send_read_req(*item);
       }
+      reader->send_reads(queued, n_queued, ctx);
+      n_queued = 0;
       return n_sent != 0;
     };
 

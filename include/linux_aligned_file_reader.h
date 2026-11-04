@@ -38,6 +38,9 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   void read_alloc(std::vector<IORequest> &read_reqs, void *ctx, std::vector<uint64_t> *page_ref = nullptr);
   int send_read(IORequest &req, void *ctx);
   int send_read(std::vector<IORequest> &reqs, void *ctx);
+#if !defined(USE_SPDK) && !defined(USE_URING)
+  void send_reads(IORequest **reqs, uint32_t n, void *ctx);
+#endif
 
   void send_io(IORequest &reqs, void *ctx, bool write);
   void send_io(std::vector<IORequest> &reqs, void *ctx, bool write);

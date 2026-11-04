@@ -761,6 +761,7 @@ void LinuxAlignedFileReader::poll_alloc(void *ctx, std::vector<uint64_t> *page_r
 
 #include <libaio.h>
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -1075,6 +1076,47 @@ int LinuxAlignedFileReader::send_read(std::vector<IORequest> &reqs, void *ring) 
   return reqs.size();
 #endif
 }
+
+#if !defined(USE_SPDK) && !defined(USE_URING)
+void LinuxAlignedFileReader::send_reads(IORequest **reqs, uint32_t n, void *ctx) {
+  // [1] the page cache first, the misses into one batch
+  iocb_t *cbs[MAX_EVENTS];
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    IORequest &req = *reqs[i];
+#ifndef READ_ONLY_TESTS
+    if (read_from_cache(this->fd, req)) {
+      continue;
+    }
+#endif
+    if (k == MAX_EVENTS) {
+      send_io(req, ctx, false);
+      continue;
+    }
+    req.finished = false;
+    auto cb = new iocb_t;
+    io_prep_pread(cb, fd, req.buf, req.len, req.offset);
+    cb->data = (void *) &req;
+    cbs[k++] = cb;
+  }
+  // [2] one io_submit for the batch, the rest resubmitted after a short accept
+  uint32_t done = 0;
+  while (done < k) {
+    int ret = io_submit((io_context_t) ctx, (long) (k - done), cbs + done);
+    if (ret == -EINTR || ret == -EAGAIN) {
+      continue;
+    }
+    if (ret <= 0) {
+      LOG(ERROR) << "io_submit() failed; returned " << ret << ", errno=" << errno << ":" << ::strerror(errno);
+      for (uint32_t i = done; i < k; i++) {
+        delete cbs[i];
+      }
+      return;
+    }
+    done += (uint32_t) ret;
+  }
+}
+#endif
 
 void LinuxAlignedFileReader::read_alloc(std::vector<IORequest> &read_reqs, void *ctx, std::vector<uint64_t> *page_ref) {
 #ifndef READ_ONLY_TESTS
