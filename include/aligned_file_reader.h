@@ -14,7 +14,8 @@ class AlignedFileReader {
 
   // returns the thread-specific io ring.
   // If not constructed, it will register the thread (using the flag) and return the context.
-  // For io_uring reader, the flag is used to set up the ring; all algorithms use 0.
+  // For io_uring reader, the flag is used to set up the ring: IORING_SETUP_SQPOLL for PipeSearch under
+  // PIPEANN_SQPOLL, otherwise 0.
   virtual void *get_ctx(int flag = 0) = 0;
 
   virtual ~AlignedFileReader() {};

@@ -1,9 +1,13 @@
 #pragma once
 // Included by pipe_search.cpp and spec_filter_search.cpp which provide all necessary headers.
 
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <type_traits>
+#ifdef USE_URING
+#include "liburing.h"
+#endif
 
 #include "candidate_pool.h"
 
@@ -36,8 +40,17 @@ namespace pipeann {
                                              std::vector<Neighbor> &full_retset, QueryStats *stats,
                                              InsertContext *insert_ctx, float range_partial, NodeOut *node_out) {
     QueryBuffer *query_buf = pop_query_buf(query1);
+#ifdef USE_URING
     // A plain ring, as for inserts: one SQPOLL kernel poller per search thread doubles the cores a search needs.
+    // PIPEANN_SQPOLL set to non-zero opts back in.
+    static const int ring_flag = [] {
+      const char *text = std::getenv("PIPEANN_SQPOLL");
+      return text != nullptr && std::atoi(text) != 0 ? (int) IORING_SETUP_SQPOLL : 0;
+    }();
+    void *ctx = reader->get_ctx(ring_flag);
+#else
     void *ctx = reader->get_ctx();
+#endif
 
     if (beam_width > MAX_N_SECTOR_READS) {
       LOG(ERROR) << "Beamwidth can not be higher than MAX_N_SECTOR_READS";
