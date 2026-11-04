@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "utils/arch_compat.h"
 #include "cuckoohash_config.hh"
 #include "cuckoohash_util.hh"
 #include "bucket_container.hh"
@@ -836,9 +837,17 @@ private:
       return *this;
     }
 
+    /** @brief Spin SPINS pauses, then yield, so a holder preempted by a busy core can run and release */
     void lock() noexcept {
-      while (lock_.test_and_set(std::memory_order_acq_rel))
-        ;
+      constexpr int SPINS = 64;
+      for (int spin = 0; lock_.test_and_set(std::memory_order_acq_rel);) {
+        if (++spin < SPINS) {
+          pipeann::cpu_pause();
+        } else {
+          spin = 0;
+          std::this_thread::yield();
+        }
+      }
     }
 
     void unlock() noexcept { lock_.clear(std::memory_order_release); }
