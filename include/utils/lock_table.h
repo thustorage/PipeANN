@@ -7,6 +7,9 @@
 #include <limits>
 #include <omp.h>
 #include <shared_mutex>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "utils/arch_compat.h"
 #include "utils/libcuckoo/cuckoohash_map.hh"
 #include "utils/log.h"
@@ -27,7 +30,8 @@ inline void thread_pause() {
 
 namespace pipeann {
   // No thread ownership: page locks are acquired by insert threads and released by background IO.
-  // Waiting only polls the state until acquisition looks possible; there is no fairness guarantee.
+  // Waiting polls the state until acquisition looks possible and sleeps on a futex after kSpins polls, as a
+  // holder may keep the lock over a disk write; there is no fairness guarantee.
   class RWSpinLock {
    public:
     int tryrdlock() {
@@ -51,31 +55,52 @@ namespace pipeann {
 
     void rdlock() {
       while (tryrdlock() != 0) {
-        while (state_.load(std::memory_order_relaxed) == -1) {
-          thread_pause();
-        }
+        wait([](int state) { return state >= 0; });
       }
     }
 
     void wrlock() {
       while (trywrlock() != 0) {
-        while (state_.load(std::memory_order_relaxed) != 0) {
-          thread_pause();
-        }
+        wait([](int state) { return state == 0; });
       }
     }
 
     void unlock() {
       if (state_.load(std::memory_order_relaxed) == -1) {
-        state_.store(0, std::memory_order_release);
+        state_.store(0, std::memory_order_seq_cst);
       } else {
-        state_.fetch_sub(1, std::memory_order_release);
+        state_.fetch_sub(1, std::memory_order_seq_cst);
+      }
+      // seq_cst pairs with wait(): either this load sees the sleeper, or the sleeper sees the new state.
+      if (sleepers_.load(std::memory_order_seq_cst) > 0) {
+        syscall(SYS_futex, reinterpret_cast<int *>(&state_), FUTEX_WAKE_PRIVATE, std::numeric_limits<int>::max(),
+                nullptr, nullptr, 0);
       }
     }
 
    private:
+    static constexpr int kSpins = 256;
+
+    // Return once `open` holds for the state, or after a futex sleep that may be spurious.
+    template<typename Open>
+    void wait(Open open) {
+      for (int spin = 0; spin < kSpins; ++spin) {
+        if (open(state_.load(std::memory_order_relaxed))) {
+          return;
+        }
+        thread_pause();
+      }
+      sleepers_.fetch_add(1, std::memory_order_seq_cst);
+      const int state = state_.load(std::memory_order_seq_cst);
+      if (!open(state)) {
+        syscall(SYS_futex, reinterpret_cast<int *>(&state_), FUTEX_WAIT_PRIVATE, state, nullptr, nullptr, 0);
+      }
+      sleepers_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     // 0: free, -1: write-held, positive: number of readers.
     std::atomic<int> state_{0};
+    std::atomic<int> sleepers_{0};  // threads asleep (or about to sleep) on state_.
   };
 
   template<class K, class HashFunction = std::hash<K>>
